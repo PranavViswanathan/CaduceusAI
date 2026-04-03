@@ -1,0 +1,106 @@
+import json
+import logging
+import re
+from datetime import datetime, timedelta
+
+import httpx
+
+from settings import settings
+
+logger = logging.getLogger(__name__)
+
+_STATIC_CARE_PLAN = {
+    "follow_up_date": (datetime.utcnow() + timedelta(days=14)).date().isoformat(),
+    "medications_to_monitor": ["Review all current medications at follow-up"],
+    "lifestyle_recommendations": [
+        "Maintain regular sleep schedule (7-9 hours)",
+        "Stay well hydrated (8+ glasses of water daily)",
+        "Follow prescribed dietary recommendations",
+        "Avoid strenuous activity until cleared by physician",
+    ],
+    "warning_signs": [
+        "Fever above 101°F (38.3°C)",
+        "Severe or worsening chest pain",
+        "Difficulty breathing or shortness of breath",
+        "Sudden vision changes",
+        "Severe headache or dizziness",
+        "Signs of infection at any wound sites",
+    ],
+}
+
+
+def _parse_json_response(raw: str) -> dict:
+    raw = raw.strip()
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if match:
+        return json.loads(match.group())
+    return json.loads(raw)
+
+
+async def generate_care_plan(patient_id: str, visit_notes: str) -> dict:
+    follow_up = (datetime.utcnow() + timedelta(days=14)).date().isoformat()
+    prompt = (
+        "You are a clinical care coordinator. Based on the visit notes below, generate a structured "
+        "care plan. Return ONLY valid JSON with these exact fields:\n"
+        f'{{"follow_up_date": "{follow_up}", '
+        '"medications_to_monitor": ["med1", "med2"], '
+        '"lifestyle_recommendations": ["rec1", "rec2"], '
+        '"warning_signs": ["sign1 the patient should call about", "sign2"]}}\n\n'
+        f"Visit Notes:\n{visit_notes}"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{settings.OLLAMA_URL}/api/generate",
+                json={"model": "llama3", "prompt": prompt, "stream": False},
+            )
+            resp.raise_for_status()
+            raw = resp.json().get("response", "")
+            parsed = _parse_json_response(raw)
+            for field in ("follow_up_date", "medications_to_monitor", "lifestyle_recommendations", "warning_signs"):
+                if field not in parsed:
+                    raise ValueError(f"Missing field: {field}")
+            return parsed
+    except Exception as exc:
+        logger.warning("Ollama care plan generation failed: %s — using static template", exc)
+        return _STATIC_CARE_PLAN.copy()
+
+
+def _rule_based_urgency(symptom_report: str) -> dict:
+    report_lower = symptom_report.lower()
+    escalate_keywords = ["chest pain", "can't breathe", "cannot breathe", "shortness of breath", "unconscious", "unresponsive", "severe pain", "heart attack", "stroke"]
+    monitor_keywords = ["fever", "vomiting", "dizzy", "dizziness", "worsening", "swelling", "rash", "infection", "bleeding"]
+
+    if any(kw in report_lower for kw in escalate_keywords):
+        return {"urgency": "escalate", "reason": "Rule-based triage: critical symptom keyword detected (LLM unavailable)."}
+    if any(kw in report_lower for kw in monitor_keywords):
+        return {"urgency": "monitor", "reason": "Rule-based triage: concerning symptom keyword detected (LLM unavailable)."}
+    return {"urgency": "routine", "reason": "Rule-based triage: no urgent keyword detected (LLM unavailable)."}
+
+
+async def assess_checkin_urgency(symptom_report: str, care_plan: dict) -> dict:
+    warning_signs = care_plan.get("warning_signs", [])
+    prompt = (
+        "You are a triage nurse. Given the patient's care plan warning signs and their symptom report, "
+        "assess the urgency. Urgency must be one of: routine, monitor, or escalate.\n"
+        "Return ONLY valid JSON: {\"urgency\": \"routine|monitor|escalate\", \"reason\": \"brief explanation\"}\n\n"
+        f"Care Plan Warning Signs:\n{chr(10).join(f'- {s}' for s in warning_signs)}\n\n"
+        f"Patient Symptom Report:\n{symptom_report}"
+    )
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                f"{settings.OLLAMA_URL}/api/generate",
+                json={"model": "llama3", "prompt": prompt, "stream": False},
+            )
+            resp.raise_for_status()
+            raw = resp.json().get("response", "")
+            parsed = _parse_json_response(raw)
+            if parsed.get("urgency") not in ("routine", "monitor", "escalate"):
+                raise ValueError("Invalid urgency value")
+            return parsed
+    except Exception as exc:
+        logger.warning("Ollama urgency assessment failed: %s — using rule-based fallback", exc)
+        return _rule_based_urgency(symptom_report)
