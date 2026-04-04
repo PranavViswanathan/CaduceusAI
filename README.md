@@ -1,4 +1,4 @@
-# MedAI Platform — Three-Tier Medical AI System
+# CaduceusAI Platform — Three-Tier Medical AI System
 
 A local-first, three-tier medical AI platform using FastAPI, Next.js 14, PostgreSQL, Redis, and Ollama for local LLM inference.
 
