@@ -20,6 +20,73 @@ MedAI Platform is a three-tier, local-first medical AI system. Every tier owns a
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
+```mermaid
+graph TD
+    subgraph T1["Tier 1 — Patient-Facing"]
+        PP["patient-portal\nNext.js :3000"]
+        PA["patient-api\nFastAPI :8001"]
+        PP <-->|JWT auth + intake| PA
+    end
+
+    subgraph T2["Tier 2 — Clinical Decision Support"]
+        DP["doctor-portal\nNext.js :3001"]
+        DA["doctor-api\nFastAPI :8002"]
+        DP <-->|JWT + role=doctor| DA
+    end
+
+    subgraph T3["Tier 3 — Post-Care"]
+        PCA["postcare-api\nFastAPI :8003"]
+    end
+
+    subgraph INFRA["Shared Infrastructure"]
+        PG[("PostgreSQL\n:5432")]
+        RD[("Redis\n:6379")]
+        OL["Ollama\n:11434\nllama3 / mistral"]
+    end
+
+    subgraph FALLBACK["Fallbacks"]
+        RB["Rule-based\ndrug check"]
+        KW["Keyword\nmatcher"]
+        ST["Static care\nplan template"]
+    end
+
+    subgraph RETRAIN["Retraining Loop"]
+        RQ["retrain_queue\nRedis list"]
+        RB2["retrain_buffer.jsonl"]
+        RL["retrain_log.jsonl"]
+        RS["retrain_loop.py"]
+    end
+
+    PA -->|write intake + audit| PG
+    DA -->|read intake, write risk + feedback| PG
+    PCA -->|write care plans + checkins| PG
+
+    DA <-->|cache risk TTL 5m| RD
+    PCA <-->|escalation_queue| RD
+    DA -->|RPUSH on override/flag| RQ
+    RQ -->|LPOP drain| RB2
+    RB2 --> RS
+    RS --> RL
+
+    DA -->|risk prompt| OL
+    PCA -->|care plan + urgency prompt| OL
+    OL -->|unavailable| RB
+    OL -->|unavailable| KW
+    OL -->|unavailable| ST
+
+    DP -->|poll escalations every 60s| PCA
+    PP -->|read care plan| PCA
+
+    DA <-->|X-Internal-Key| PCA
+
+    style T1 fill:transparent,stroke:#1D9E75,stroke-width:1.5px,stroke-dasharray:5 4
+    style T2 fill:transparent,stroke:#7F77DD,stroke-width:1.5px,stroke-dasharray:5 4
+    style T3 fill:transparent,stroke:#5DCAA5,stroke-width:1.5px,stroke-dasharray:5 4
+    style INFRA fill:transparent,stroke:#888780,stroke-width:1.5px,stroke-dasharray:5 4
+    style FALLBACK fill:transparent,stroke:#BA7517,stroke-width:1.5px,stroke-dasharray:5 4
+    style RETRAIN fill:transparent,stroke:#D85A30,stroke-width:1.5px,stroke-dasharray:5 4
+```
+
 ---
 
 ## Directory Layout
