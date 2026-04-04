@@ -4,7 +4,7 @@ import { useState } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { loginPatient } from '@/lib/api'
-import { saveToken } from '@/lib/auth'
+import { savePatientId } from '@/lib/auth'
 
 export default function LoginPage() {
   const router = useRouter()
@@ -12,7 +12,6 @@ export default function LoginPage() {
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [mfaCode, setMfaCode] = useState('')
-  const [token, setToken] = useState('')
   const [patientId, setPatientId] = useState('')
   const [errors, setErrors] = useState<Record<string, string>>({})
   const [submitting, setSubmitting] = useState(false)
@@ -28,10 +27,7 @@ export default function LoginPage() {
     setErrors({})
     try {
       const data = await loginPatient(email, password)
-      // Decode patient ID from JWT payload (sub field)
-      const payload = JSON.parse(atob(data.access_token.split('.')[1]))
-      setToken(data.access_token)
-      setPatientId(payload.sub)
+      setPatientId(data.patient_id)
       setStep(2)
     } catch (err) {
       setErrors({ api: err instanceof Error ? err.message : 'Invalid credentials' })
@@ -46,7 +42,7 @@ export default function LoginPage() {
       setErrors({ mfa: 'Invalid code. Please try again.' })
       return
     }
-    saveToken(token, patientId)
+    savePatientId(patientId)
     router.push('/dashboard')
   }
 
@@ -58,6 +54,10 @@ export default function LoginPage() {
           <p className="text-slate-500 mt-1">
             {step === 1 ? 'Enter your credentials to continue' : 'Two-factor authentication'}
           </p>
+        </div>
+
+        <div className="mb-4 p-3 bg-amber-50 border border-amber-200 rounded-lg text-amber-800 text-sm">
+          <strong>Demo credentials:</strong> patient@demo.com / demo1234
         </div>
 
         <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-8">

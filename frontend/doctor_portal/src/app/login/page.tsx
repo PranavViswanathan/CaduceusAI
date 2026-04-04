@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { loginDoctor } from '@/lib/api'
-import { saveToken } from '@/lib/auth'
+import { saveDoctorId } from '@/lib/auth'
 
 export default function LoginPage() {
   const router = useRouter()
@@ -23,8 +23,7 @@ export default function LoginPage() {
     setErrors({})
     try {
       const data = await loginDoctor(email, password)
-      const payload = JSON.parse(atob(data.access_token.split('.')[1]))
-      saveToken(data.access_token, payload.sub)
+      saveDoctorId(data.doctor_id)
       router.push('/patients')
     } catch (err) {
       setErrors({ api: err instanceof Error ? err.message : 'Invalid credentials' })
@@ -44,6 +43,10 @@ export default function LoginPage() {
           </div>
           <h1 className="text-2xl font-bold text-slate-900">MedAI Clinical Dashboard</h1>
           <p className="text-slate-500 mt-1">Sign in with your clinician credentials</p>
+        </div>
+
+        <div className="mb-4 p-3 bg-amber-50 border border-amber-200 rounded-lg text-amber-800 text-sm">
+          <strong>Demo credentials:</strong> doctor@demo.com / demo1234
         </div>
 
         <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-8">

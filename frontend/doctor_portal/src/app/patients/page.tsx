@@ -4,7 +4,7 @@ import { useState, useEffect, useRef } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { getPatients, getPendingEscalations, PatientListItem, Escalation } from '@/lib/api'
-import { getToken, clearAuth } from '@/lib/auth'
+import { getDoctorId, logout } from '@/lib/auth'
 
 export default function PatientsPage() {
   const router = useRouter()
@@ -14,9 +14,9 @@ export default function PatientsPage() {
   const [error, setError] = useState('')
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
-  async function loadEscalations(token: string) {
+  async function loadEscalations() {
     try {
-      const data = await getPendingEscalations(token)
+      const data = await getPendingEscalations()
       setEscalations(data)
     } catch {
       // silent — escalation polling failures don't block the main UI
@@ -24,21 +24,20 @@ export default function PatientsPage() {
   }
 
   useEffect(() => {
-    const token = getToken()
-    if (!token) { router.replace('/login'); return }
+    if (!getDoctorId()) { router.replace('/login'); return }
 
-    Promise.all([getPatients(token), getPendingEscalations(token)])
+    Promise.all([getPatients(), getPendingEscalations()])
       .then(([p, e]) => { setPatients(p); setEscalations(e) })
       .catch(err => setError(err instanceof Error ? err.message : 'Failed to load'))
       .finally(() => setLoading(false))
 
     // Poll escalations every 60 seconds
-    intervalRef.current = setInterval(() => loadEscalations(token), 60_000)
+    intervalRef.current = setInterval(loadEscalations, 60_000)
     return () => { if (intervalRef.current) clearInterval(intervalRef.current) }
   }, [router])
 
-  function handleLogout() {
-    clearAuth()
+  async function handleLogout() {
+    await logout()
     router.push('/login')
   }
 

@@ -68,46 +68,46 @@ async function handleResponse<T>(res: Response): Promise<T> {
 }
 
 export async function registerPatient(data: RegisterData): Promise<{ patient_id: string }> {
-  const res = await fetch(`${PATIENT_API}/auth/register`, {
+  const res = await fetch(`${PATIENT_API}/v1/auth/register`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
     body: JSON.stringify(data),
   })
   return handleResponse(res)
 }
 
-export async function loginPatient(email: string, password: string): Promise<{ access_token: string }> {
+export async function loginPatient(email: string, password: string): Promise<{ patient_id: string }> {
   const form = new URLSearchParams({ username: email, password })
-  const res = await fetch(`${PATIENT_API}/auth/token`, {
+  const res = await fetch(`${PATIENT_API}/v1/auth/token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    credentials: 'include',
     body: form.toString(),
   })
   return handleResponse(res)
 }
 
-export async function submitIntake(data: IntakeData, token: string): Promise<IntakeResponse> {
-  const res = await fetch(`${PATIENT_API}/patients/intake`, {
+export async function submitIntake(data: IntakeData): Promise<IntakeResponse> {
+  const res = await fetch(`${PATIENT_API}/v1/patients/intake`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${token}`,
-    },
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
     body: JSON.stringify(data),
   })
   return handleResponse(res)
 }
 
-export async function getPatient(patientId: string, token: string): Promise<PatientData> {
-  const res = await fetch(`${PATIENT_API}/patients/${patientId}`, {
-    headers: { Authorization: `Bearer ${token}` },
+export async function getPatient(patientId: string): Promise<PatientData> {
+  const res = await fetch(`${PATIENT_API}/v1/patients/${patientId}`, {
+    credentials: 'include',
   })
   return handleResponse(res)
 }
 
-export async function getCarePlan(patientId: string, token: string): Promise<CarePlanData | null> {
-  const res = await fetch(`${POSTCARE_API}/careplan/${patientId}`, {
-    headers: { Authorization: `Bearer ${token}` },
+export async function getCarePlan(patientId: string): Promise<CarePlanData | null> {
+  const res = await fetch(`${POSTCARE_API}/v1/careplan/${patientId}`, {
+    credentials: 'include',
   })
   if (res.status === 404) return null
   return handleResponse(res)

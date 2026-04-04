@@ -76,7 +76,9 @@ If no known interactions are found, it returns a generic low-confidence warning.
 
 ### Caching
 
-Successful assessments are cached in Redis under key `risk:{patient_id}` with a 300-second TTL. Cache misses are treated as no-ops (the assessment is always recomputed; the cache is best-effort).
+Successful assessments are cached in Redis under key `risk:{patient_id}` with a 300-second TTL. Cache misses are treated as no-ops (the assessment is always recomputed on a miss; the cache is best-effort).
+
+When a doctor submits feedback (`POST /v1/doctor/patients/{id}/feedback`), the cache key for that patient is **immediately deleted** (`redis.delete(f"risk:{patient_id}")`). This ensures the next risk request reflects the updated clinical context rather than serving a stale cached result.
 
 ---
 
@@ -165,7 +167,7 @@ Keyword scanning in the symptom report text (case-insensitive):
 If urgency is `escalate`:
 1. An `Escalation` row is written to PostgreSQL
 2. The escalation is pushed to Redis `escalation_queue`
-3. The doctor portal polls `GET /escalations/pending` every 60 seconds and shows a red alert banner
+3. The doctor portal polls `GET /v1/escalations/pending` every 60 seconds and shows a red alert banner
 
 ---
 
@@ -173,17 +175,35 @@ If urgency is `escalate`:
 
 Ollama is started as a Docker service and is accessible at `http://ollama:11434` inside the Docker network (configured via `OLLAMA_URL` in `.env`).
 
-### Pulling Models
+### Automatic Model Setup
 
-```bash
-# Pull the recommended model (llama3, ~4.7 GB)
-docker exec -it medical-ai-platform-ollama-1 ollama pull llama3
+Models are pulled automatically on first boot by the `ollama-init` Docker Compose service:
 
-# Or the lighter alternative (mistral, ~4.1 GB)
-docker exec -it medical-ai-platform-ollama-1 ollama pull mistral
+```yaml
+ollama-init:
+  image: ollama/ollama
+  volumes:
+    - ollama_data:/root/.ollama
+  depends_on:
+    ollama:
+      condition: service_healthy
+  entrypoint: >
+    sh -c "
+      ollama pull llama3 --host http://ollama:11434 &&
+      ollama pull mistral --host http://ollama:11434
+    "
+  restart: "no"
 ```
 
-Models persist in the Ollama Docker volume between restarts.
+Model weights are stored in the `ollama_data` Docker volume. On subsequent `docker compose up` runs the volume already contains the weights, so `ollama-init` exits immediately without re-downloading.
+
+### Manual Pull (if needed)
+
+```bash
+# Pull into a running stack
+docker exec -it medical-ai-platform-ollama-1 ollama pull llama3
+docker exec -it medical-ai-platform-ollama-1 ollama pull mistral
+```
 
 ### Async HTTP Client
 
@@ -222,10 +242,10 @@ Feedback with `action = agree` is stored in the database but **not** queued for 
 
 ### 2. Buffer Drain
 
-The internal endpoint `POST /doctor/retrain/trigger` (requires `X-Internal-Key`) pops all items from Redis and appends them to `data/retrain_buffer.jsonl`:
+The internal endpoint `POST /v1/doctor/retrain/trigger` (requires `X-Internal-Key`) pops all items from Redis and appends them to `data/retrain_buffer.jsonl`:
 
 ```bash
-curl -X POST http://localhost:8002/doctor/retrain/trigger \
+curl -X POST http://localhost:8002/v1/doctor/retrain/trigger \
   -H "X-Internal-Key: <INTERNAL_API_KEY>"
 ```
 
@@ -262,7 +282,7 @@ The script's docstring describes the full production pipeline the retrain loop i
 
 ## Assessment Versioning
 
-Every call to `GET /doctor/patients/{id}/risk` stores a new `RiskAssessment` row with an incrementing `version` integer. This means:
+Every call to `GET /v1/doctor/patients/{id}/risk` stores a new `RiskAssessment` row with an incrementing `version` integer. This means:
 
 - Doctors always see the most recent assessment
 - All historical assessments (and their `source`: `llm` or `rule_based`) are retained

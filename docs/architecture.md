@@ -28,34 +28,56 @@ MedAI Platform is a three-tier, local-first medical AI system. Every tier owns a
 medical-ai-platform/
 ├── docker-compose.yml              # Full stack orchestration
 ├── .env.example                    # Configuration template
+├── alembic.ini                     # Alembic configuration
+├── alembic/
+│   ├── env.py                      # Reads DATABASE_URL from environment
+│   └── versions/
+│       └── 001_initial_schema.py   # Creates all 8 tables + extensions
 ├── db/
 │   └── init.sql                    # PostgreSQL extension bootstrap (uuid-ossp, pgcrypto)
 ├── services/
 │   ├── patient_api/                # Tier 1 backend  (port 8001)
-│   │   ├── main.py                 # Routes: auth, intake, profile, health
+│   │   ├── main.py                 # Routes: /v1/auth, /v1/patients, /health
 │   │   ├── models.py               # ORM: Patient, PatientIntake, AuditLog
-│   │   ├── schemas.py              # Pydantic: PatientRegister, IntakeCreate, Token
-│   │   ├── auth.py                 # JWT creation + get_current_patient dependency
+│   │   ├── schemas.py              # Pydantic: PatientRegister, IntakeCreate, LoginResponse
+│   │   ├── auth.py                 # Cookie-first JWT auth + get_current_patient dependency
 │   │   ├── encryption.py           # Fernet AES-256 for PHI fields
 │   │   ├── database.py             # SQLAlchemy engine + session factory
 │   │   ├── settings.py             # Settings loaded from .env
 │   │   ├── logging_utils.py        # Structured audit log writer
-│   │   └── Dockerfile
+│   │   ├── requirements.txt
+│   │   ├── requirements-test.txt
+│   │   ├── Dockerfile
+│   │   └── tests/
+│   │       ├── conftest.py         # Fixtures: mock_db, authed_client, sample_patient
+│   │       ├── test_auth.py        # Registration, login, logout, validation
+│   │       └── test_patients.py    # Intake, profile retrieval, auth guards
 │   ├── doctor_api/                 # Tier 2 backend  (port 8002)
-│   │   ├── main.py                 # Routes: auth, risk, feedback, retrain trigger, escalations
-│   │   ├── models.py               # ORM: Doctor, RiskAssessment, Feedback, Escalation, FollowupCheckin
-│   │   ├── schemas.py              # Pydantic: DoctorRegister, FeedbackCreate, RiskAssessmentResponse
+│   │   ├── main.py                 # Routes: /v1/auth, /v1/doctor, /v1/escalations, /health
+│   │   ├── models.py               # ORM: Doctor, RiskAssessment, Feedback, Escalation
+│   │   ├── schemas.py              # Pydantic: DoctorRegister, FeedbackCreate, LoginResponse
 │   │   ├── llm.py                  # Ollama + rule-based risk assessment
-│   │   ├── auth.py                 # Doctor token + role validation
+│   │   ├── auth.py                 # Cookie-first JWT auth + doctor-role guard
 │   │   ├── encryption.py           # Field decryption (reads encrypted DOB)
-│   │   └── Dockerfile
+│   │   ├── requirements.txt
+│   │   ├── requirements-test.txt
+│   │   ├── Dockerfile
+│   │   └── tests/
+│   │       ├── conftest.py
+│   │       ├── test_auth.py
+│   │       └── test_doctor.py      # Risk assessment, feedback, cache invalidation
 │   └── postcare_api/               # Tier 3 backend  (port 8003)
-│       ├── main.py                 # Routes: care plan, check-ins, escalations
+│       ├── main.py                 # Routes: /v1/careplan, /v1/followup, /v1/escalations, /health
 │       ├── models.py               # ORM: CarePlan, FollowupCheckin, Escalation
 │       ├── schemas.py              # Pydantic: CarePlanCreate, CheckinCreate, EscalationResponse
 │       ├── llm.py                  # Care plan generation + urgency assessment
-│       ├── auth.py                 # JWT verification + doctor-role guard
-│       └── Dockerfile
+│       ├── auth.py                 # Cookie-first JWT auth; get_current_user + require_doctor
+│       ├── requirements.txt
+│       ├── requirements-test.txt
+│       ├── Dockerfile
+│       └── tests/
+│           ├── conftest.py         # JWT Bearer header fixtures for TestClient
+│           └── test_postcare.py    # Care plans, checkins, escalation acknowledgment
 ├── frontend/
 │   ├── patient_portal/             # Tier 1 UI  (port 3000)
 │   │   └── src/app/
@@ -64,8 +86,8 @@ medical-ai-platform/
 │   │       ├── intake/page.tsx     # 5-step intake wizard
 │   │       ├── dashboard/page.tsx
 │   │       └── lib/
-│   │           ├── api.ts          # API client
-│   │           └── auth.ts         # JWT + patient_id in localStorage
+│   │           ├── api.ts          # API client (credentials: 'include', /v1/ URLs)
+│   │           └── auth.ts         # patient_id in localStorage; async logout()
 │   └── doctor_portal/              # Tier 2 UI  (port 3001)
 │       └── src/app/
 │           ├── login/page.tsx
@@ -95,17 +117,35 @@ medical-ai-platform/
 | `postgres` | 5432 | Single shared database (all tables) |
 | `redis` | 6379 | Risk assessment cache, retrain queue, escalation queue |
 | `ollama` | 11434 | Local LLM inference (llama3 / mistral) |
+| `ollama-init` | — | One-shot: pulls llama3 + mistral into shared `ollama_data` volume |
+| `migrate` | — | One-shot: runs `alembic upgrade head` before APIs start |
 
 ---
 
 ## Request Flows
 
+### Patient Login
+
+```
+patient-portal
+  → POST /v1/auth/token  (patient-api:8001)
+      ├── Verify credentials
+      ├── Issue JWT (HS256, 30 min TTL)
+      ├── Set httpOnly cookie: patient_access_token
+      └── Return { patient_id, token_type: "cookie" }
+
+Browser stores patient_id in localStorage (not the JWT).
+Subsequent requests send the cookie automatically.
+```
+
 ### Patient Intake
 
 ```
 patient-portal
-  → POST /patients/intake  (patient-api:8001)
-      ├── Validate JWT
+  → POST /v1/patients/intake  (patient-api:8001)
+      ├── Read patient_access_token cookie (or Bearer fallback)
+      ├── Decode + verify JWT
+      ├── Validate Pydantic schema (symptoms 10–5000 chars)
       ├── Write PatientIntake row
       └── Write AuditLog row
 ```
@@ -114,8 +154,9 @@ patient-portal
 
 ```
 doctor-portal
-  → GET /doctor/patients/{id}/risk  (doctor-api:8002)
-      ├── Validate JWT + role=doctor
+  → GET /v1/doctor/patients/{id}/risk  (doctor-api:8002)
+      ├── Read doctor_access_token cookie (or Bearer fallback)
+      ├── Validate JWT + assert role=doctor
       ├── Read PatientIntake from PostgreSQL
       ├── Check Redis cache (key: risk:{patient_id}, TTL 5m)
       │   ├── HIT  → return cached assessment
@@ -127,11 +168,24 @@ doctor-portal
       └── Return assessment
 ```
 
+### Feedback + Cache Invalidation
+
+```
+doctor-portal
+  → POST /v1/doctor/patients/{id}/feedback  (doctor-api:8002)
+      ├── Write Feedback row
+      ├── DELETE Redis key risk:{patient_id}   ← cache invalidated
+      └── If action == override|flag:
+          └── RPUSH retrain_queue  (Redis)
+```
+
 ### Follow-up Check-in & Escalation
 
 ```
 patient-portal (or API client)
-  → POST /followup/checkin  (postcare-api:8003)
+  → POST /v1/followup/checkin  (postcare-api:8003)
+      ├── Read patient_access_token or doctor_access_token cookie
+      ├── Validate symptom_report (10–5000 chars)
       ├── Read latest CarePlan (warning_signs)
       ├── Call llm.assess_checkin_urgency()
       │   ├── Ollama urgency classification (routine|monitor|escalate)
@@ -143,21 +197,21 @@ patient-portal (or API client)
       └── Return checkin + urgency
 
 doctor-portal
-  → polls GET /escalations/pending  every 60s  (postcare-api:8003)
-  → POST /escalations/{id}/acknowledge
+  → polls GET /v1/escalations/pending  every 60s  (postcare-api:8003)
+  → POST /v1/escalations/{id}/acknowledge
 ```
 
 ### Feedback → Retraining
 
 ```
 doctor-portal
-  → POST /doctor/patients/{id}/feedback  (doctor-api:8002)
+  → POST /v1/doctor/patients/{id}/feedback  (doctor-api:8002)
       ├── Write Feedback row
       └── If action == override|flag:
           └── RPUSH retrain_queue  (Redis)
 
 (manual or scheduled)
-  → POST /doctor/retrain/trigger  (doctor-api:8002, requires X-Internal-Key)
+  → POST /v1/doctor/retrain/trigger  (doctor-api:8002, requires X-Internal-Key)
       └── LPOP all items from retrain_queue
           └── Append to data/retrain_buffer.jsonl
 
@@ -174,15 +228,30 @@ python3 scripts/retrain_loop.py
 
 ```
 postgres  ──(healthy)──┐
-redis     ──(healthy)──┤──→  patient-api
-                       ├──→  doctor-api
-                       └──→  postcare-api
+                       ├──→  migrate ──(completed)──┐
+redis     ──(healthy)──┘                            ├──→  patient-api
+                                                    ├──→  doctor-api
+                                                    └──→  postcare-api
+
+ollama ──(healthy)──→  ollama-init  (pulls llama3 + mistral; runs once)
 
 patient-api  ──(started)──→  patient-portal
 doctor-api   ──(started)──→  doctor-portal
 ```
 
-All three APIs wait for postgres and redis to pass health checks before accepting traffic. Table creation runs automatically on first start (SQLAlchemy `create_all`).
+The `migrate` service runs `alembic upgrade head` once against PostgreSQL, creating all tables. API services start only after `migrate` exits successfully. The `ollama-init` service pulls required model weights on first boot; subsequent restarts skip the pull because weights are cached in the `ollama_data` Docker volume.
+
+---
+
+## API Versioning
+
+All routes are registered on an `APIRouter(prefix="/v1")`. The unversioned `/health` endpoint remains accessible for liveness probes without authentication. Future breaking changes would introduce a `/v2/` router without removing `/v1/`.
+
+---
+
+## Rate Limiting
+
+Auth endpoints (`/v1/auth/token`, `/v1/auth/register`) are rate-limited to **5 requests/minute per IP** using SlowAPI. When `TESTING=true`, the limit is raised to 1000/minute so tests are not throttled. All other endpoints are currently unlimited.
 
 ---
 
@@ -210,7 +279,20 @@ or, when a dependency is degraded:
 
 ## Inter-Service Authentication
 
-Service-to-service calls (e.g., `doctor-api` triggering a retrain drain, `postcare-api` generating a care plan) use the `X-Internal-Key` header matched against `INTERNAL_API_KEY` in `.env`. Patient and doctor JWTs are **not** accepted on internal routes.
+Service-to-service calls (e.g., `doctor-api` triggering a retrain drain, `postcare-api` generating a care plan) use the `X-Internal-Key` header matched against `INTERNAL_API_KEY` in `.env`. Patient and doctor session cookies are **not** accepted on internal routes.
+
+---
+
+## Cookie-Based Authentication
+
+Login endpoints set an httpOnly cookie scoped to `domain=localhost` (no port). Because RFC 6265 matches cookies by host only (ignoring port), a cookie set by `:8001` is sent to `:8002` and `:8003`. Chrome treats `localhost` as a secure context, so `SameSite=None; Secure` works over plain HTTP on localhost. The JWTs are never exposed to JavaScript.
+
+| Cookie name | Set by | Read by |
+|---|---|---|
+| `patient_access_token` | patient-api | patient-api, postcare-api |
+| `doctor_access_token` | doctor-api | doctor-api, postcare-api |
+
+Each auth dependency reads the cookie first; if absent, it falls back to an `Authorization: Bearer` header for Swagger UI and programmatic testing.
 
 ---
 
@@ -218,7 +300,7 @@ Service-to-service calls (e.g., `doctor-api` triggering a retrain drain, `postca
 
 | Variable | Used By | Purpose |
 |---|---|---|
-| `DATABASE_URL` | all APIs | SQLAlchemy connection string |
+| `DATABASE_URL` | all APIs, migrate | SQLAlchemy connection string |
 | `REDIS_URL` | all APIs | Redis connection |
 | `OLLAMA_URL` | doctor-api, postcare-api | Ollama inference endpoint |
 | `JWT_SECRET` | all APIs | HMAC key for HS256 tokens |
@@ -241,5 +323,6 @@ Service-to-service calls (e.g., `doctor-api` triggering a retrain drain, `postca
 | Redis down | Cache miss treated as no-op; queue pushes fail silently with a log warning |
 | PHI decryption failure | Field returns `None`; request continues |
 | Audit log write failure | DB error rolled back; request continues (logging failure ≠ auth failure) |
-| JWT expired | HTTP 401 `Invalid or expired token` |
+| Session cookie missing / expired | HTTP 401 `Not authenticated` |
 | Missing `X-Internal-Key` | HTTP 403 `Forbidden` |
+| Rate limit exceeded | HTTP 429 `Too Many Requests` |

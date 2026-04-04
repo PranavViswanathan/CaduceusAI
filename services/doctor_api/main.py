@@ -1,30 +1,40 @@
 import json
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated
 
 import redis as redis_lib
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from passlib.context import CryptContext
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from auth import create_access_token, get_current_doctor
-from database import Base, engine, get_db
+from database import Base, SessionLocal, engine, get_db
 from encryption import decrypt
 from llm import get_risk_assessment
 from logging_utils import write_structured_log
 from models import AuditLog, Doctor, Escalation, FollowupCheckin, Patient, PatientIntake, RiskAssessment, Feedback
-from schemas import DoctorRegister, FeedbackCreate, PatientListItem, RiskAssessmentResponse, Token
+from schemas import DoctorRegister, FeedbackCreate, LoginResponse, PatientListItem, RiskAssessmentResponse
 from settings import settings
 
 logger = logging.getLogger(__name__)
 
+_TESTING = os.getenv("TESTING", "false").lower() == "true"
+_AUTH_RATE_LIMIT = "1000/minute" if _TESTING else "5/minute"
+
+limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="Doctor API", version="1.0.0")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,12 +46,31 @@ app.add_middleware(
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 RETRAIN_BUFFER = Path("/app/data/retrain_buffer.jsonl")
+router = APIRouter(prefix="/v1")
 
 
 @app.on_event("startup")
 def on_startup() -> None:
+    if _TESTING:
+        return
     Base.metadata.create_all(bind=engine)
     RETRAIN_BUFFER.parent.mkdir(parents=True, exist_ok=True)
+    db = SessionLocal()
+    try:
+        if not db.query(Doctor).filter(Doctor.email == "doctor@demo.com").first():
+            demo = Doctor(
+                email="doctor@demo.com",
+                hashed_password=pwd_context.hash("demo1234"),
+                name="Dr. Demo",
+                specialty="General Practice",
+            )
+            db.add(demo)
+            db.commit()
+    except Exception as exc:
+        logger.warning("Could not seed demo doctor: %s", exc)
+        db.rollback()
+    finally:
+        db.close()
 
 
 def _get_redis():
@@ -62,7 +91,20 @@ def _write_audit(db: Session, route: str, action: str, outcome: str, actor_id=No
         db.rollback()
 
 
-@app.post("/auth/register", status_code=201)
+def _set_auth_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        key="doctor_access_token",
+        value=token,
+        httponly=True,
+        max_age=settings.JWT_EXPIRE_MINUTES * 60,
+        path="/",
+        domain="localhost",
+        samesite="none",
+        secure=True,
+    )
+
+
+@router.post("/auth/register", status_code=201)
 def register_doctor(body: DoctorRegister, db: Session = Depends(get_db)):
     if db.query(Doctor).filter(Doctor.email == body.email).first():
         raise HTTPException(status_code=400, detail="Email already registered")
@@ -82,18 +124,37 @@ def register_doctor(body: DoctorRegister, db: Session = Depends(get_db)):
     return {"message": "registered", "doctor_id": str(doctor.id)}
 
 
-@app.post("/auth/token", response_model=Token)
-def login(form: Annotated[OAuth2PasswordRequestForm, Depends()], request: Request, db: Session = Depends(get_db)):
+@router.post("/auth/token", response_model=LoginResponse)
+@limiter.limit(_AUTH_RATE_LIMIT)
+def login(
+    form: Annotated[OAuth2PasswordRequestForm, Depends()],
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
     doctor = db.query(Doctor).filter(Doctor.email == form.username).first()
     if not doctor or not pwd_context.verify(form.password, doctor.hashed_password):
-        write_structured_log("/auth/token", "login", "failed", request)
+        write_structured_log("/v1/auth/token", "login", "failed", request)
         raise HTTPException(status_code=401, detail="Invalid credentials")
     token = create_access_token({"sub": str(doctor.id)})
-    write_structured_log("/auth/token", "login", "success", request, str(doctor.id))
-    return Token(access_token=token)
+    _set_auth_cookie(response, token)
+    write_structured_log("/v1/auth/token", "login", "success", request, str(doctor.id))
+    return LoginResponse(doctor_id=str(doctor.id))
 
 
-@app.get("/doctor/patients")
+@router.post("/auth/logout")
+def logout(response: Response):
+    response.delete_cookie(
+        key="doctor_access_token",
+        path="/",
+        domain="localhost",
+        samesite="none",
+        secure=True,
+    )
+    return {"status": "logged out"}
+
+
+@router.get("/doctor/patients")
 def list_patients(
     request: Request,
     current_doctor: Doctor = Depends(get_current_doctor),
@@ -114,11 +175,11 @@ def list_patients(
             intake_submitted_at=intake.submitted_at if intake else None,
         ))
 
-    write_structured_log("/doctor/patients", "list_patients", "success", request, str(current_doctor.id))
+    write_structured_log("/v1/doctor/patients", "list_patients", "success", request, str(current_doctor.id))
     return result
 
 
-@app.get("/doctor/patients/{patient_id}/risk", response_model=RiskAssessmentResponse)
+@router.get("/doctor/patients/{patient_id}/risk", response_model=RiskAssessmentResponse)
 async def get_patient_risk(
     patient_id: str,
     request: Request,
@@ -133,7 +194,7 @@ async def get_patient_risk(
             cached = redis.get(cache_key)
             if cached:
                 data = json.loads(cached)
-                write_structured_log(f"/doctor/patients/{patient_id}/risk", "risk_cache_hit", "success", request, str(current_doctor.id), patient_id)
+                write_structured_log(f"/v1/doctor/patients/{patient_id}/risk", "risk_cache_hit", "success", request, str(current_doctor.id), patient_id)
                 return RiskAssessmentResponse(**data)
         except Exception as exc:
             logger.warning("Redis read error: %s", exc)
@@ -200,12 +261,12 @@ async def get_patient_risk(
         except Exception as exc:
             logger.warning("Redis write error: %s", exc)
 
-    _write_audit(db, f"/doctor/patients/{patient_id}/risk", "risk_assessed", "success", str(current_doctor.id), patient_id, request.client.host if request.client else None)
-    write_structured_log(f"/doctor/patients/{patient_id}/risk", "risk_assessed", "success", request, str(current_doctor.id), patient_id)
+    _write_audit(db, f"/v1/doctor/patients/{patient_id}/risk", "risk_assessed", "success", str(current_doctor.id), patient_id, request.client.host if request.client else None)
+    write_structured_log(f"/v1/doctor/patients/{patient_id}/risk", "risk_assessed", "success", request, str(current_doctor.id), patient_id)
     return response
 
 
-@app.post("/doctor/patients/{patient_id}/feedback")
+@router.post("/doctor/patients/{patient_id}/feedback")
 def submit_feedback(
     patient_id: str,
     body: FeedbackCreate,
@@ -213,9 +274,6 @@ def submit_feedback(
     current_doctor: Doctor = Depends(get_current_doctor),
     db: Session = Depends(get_db),
 ):
-    if body.action not in ("agree", "override", "flag"):
-        raise HTTPException(status_code=422, detail="action must be agree, override, or flag")
-
     try:
         fb = Feedback(
             patient_id=patient_id,
@@ -230,9 +288,15 @@ def submit_feedback(
         db.rollback()
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
 
-    if body.action in ("override", "flag"):
-        redis = _get_redis()
-        if redis:
+    # Invalidate risk cache so next view reflects updated feedback context
+    redis = _get_redis()
+    if redis:
+        try:
+            redis.delete(f"risk:{patient_id}")
+        except Exception as exc:
+            logger.warning("Redis cache invalidation failed: %s", exc)
+
+        if body.action in ("override", "flag"):
             try:
                 payload = json.dumps({
                     "patient_id": patient_id,
@@ -246,12 +310,12 @@ def submit_feedback(
             except Exception as exc:
                 logger.warning("Redis LPUSH failed: %s", exc)
 
-    _write_audit(db, f"/doctor/patients/{patient_id}/feedback", "feedback_submit", "success", str(current_doctor.id), patient_id, request.client.host if request.client else None)
-    write_structured_log(f"/doctor/patients/{patient_id}/feedback", "feedback_submit", "success", request, str(current_doctor.id), patient_id)
+    _write_audit(db, f"/v1/doctor/patients/{patient_id}/feedback", "feedback_submit", "success", str(current_doctor.id), patient_id, request.client.host if request.client else None)
+    write_structured_log(f"/v1/doctor/patients/{patient_id}/feedback", "feedback_submit", "success", request, str(current_doctor.id), patient_id)
     return {"status": "recorded"}
 
 
-@app.post("/doctor/retrain/trigger")
+@router.post("/doctor/retrain/trigger")
 def trigger_retrain(x_internal_key: Annotated[str | None, Header()] = None):
     if x_internal_key != settings.INTERNAL_API_KEY:
         raise HTTPException(status_code=403, detail="Forbidden")
@@ -277,7 +341,7 @@ def trigger_retrain(x_internal_key: Annotated[str | None, Header()] = None):
     return {"processed": len(items)}
 
 
-@app.get("/escalations/pending")
+@router.get("/escalations/pending")
 def pending_escalations(
     current_doctor: Doctor = Depends(get_current_doctor),
     db: Session = Depends(get_db),
@@ -300,6 +364,9 @@ def pending_escalations(
             "created_at": esc.created_at.isoformat(),
         })
     return result
+
+
+app.include_router(router)
 
 
 @app.get("/health")

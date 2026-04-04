@@ -1,27 +1,36 @@
 import logging
-from datetime import datetime
+import os
 from typing import Annotated
 
 import redis as redis_lib
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from passlib.context import CryptContext
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
+from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
-from sqlalchemy import text
 
-from auth import create_access_token, get_current_patient, verify_token
+from auth import create_access_token, get_current_patient
 from database import Base, SessionLocal, engine, get_db
 from encryption import decrypt, encrypt
 from logging_utils import write_structured_log
 from models import AuditLog, Patient, PatientIntake
-from schemas import IntakeCreate, IntakeResponse, PatientRegister, PatientResponse, Token
+from schemas import IntakeCreate, IntakeResponse, LoginResponse, PatientRegister, PatientResponse
 from settings import settings
 
 logger = logging.getLogger(__name__)
 
+_TESTING = os.getenv("TESTING", "false").lower() == "true"
+_AUTH_RATE_LIMIT = "1000/minute" if _TESTING else "5/minute"
+
+limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="Patient API", version="1.0.0")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,11 +41,32 @@ app.add_middleware(
 )
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+router = APIRouter(prefix="/v1")
 
 
 @app.on_event("startup")
 def on_startup() -> None:
+    if _TESTING:
+        return
     Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        if not db.query(Patient).filter(Patient.email == "patient@demo.com").first():
+            demo = Patient(
+                email="patient@demo.com",
+                hashed_password=pwd_context.hash("demo1234"),
+                name="Demo Patient",
+                dob_encrypted=encrypt("1990-01-01"),
+                sex="other",
+                phone="555-0100",
+            )
+            db.add(demo)
+            db.commit()
+    except Exception as exc:
+        logger.warning("Could not seed demo patient: %s", exc)
+        db.rollback()
+    finally:
+        db.close()
 
 
 def _write_audit(
@@ -64,7 +94,20 @@ def _write_audit(
         db.rollback()
 
 
-@app.post("/auth/register", status_code=status.HTTP_201_CREATED)
+def _set_auth_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        key="patient_access_token",
+        value=token,
+        httponly=True,
+        max_age=settings.JWT_EXPIRE_MINUTES * 60,
+        path="/",
+        domain="localhost",
+        samesite="none",
+        secure=True,
+    )
+
+
+@router.post("/auth/register", status_code=status.HTTP_201_CREATED)
 def register(body: PatientRegister, request: Request, db: Session = Depends(get_db)):
     existing = db.query(Patient).filter(Patient.email == body.email).first()
     if existing:
@@ -86,25 +129,44 @@ def register(body: PatientRegister, request: Request, db: Session = Depends(get_
         logger.error("DB error on register: %s", exc)
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
 
-    _write_audit(db, "/auth/register", "register", "success", str(patient.id), str(patient.id), request.client.host if request.client else None)
-    write_structured_log("/auth/register", "register", "success", request, str(patient.id))
+    _write_audit(db, "/v1/auth/register", "register", "success", str(patient.id), str(patient.id), request.client.host if request.client else None)
+    write_structured_log("/v1/auth/register", "register", "success", request, str(patient.id))
     return {"message": "registered", "patient_id": str(patient.id)}
 
 
-@app.post("/auth/token", response_model=Token)
-def login(form: Annotated[OAuth2PasswordRequestForm, Depends()], request: Request, db: Session = Depends(get_db)):
+@router.post("/auth/token", response_model=LoginResponse)
+@limiter.limit(_AUTH_RATE_LIMIT)
+def login(
+    form: Annotated[OAuth2PasswordRequestForm, Depends()],
+    request: Request,
+    response: Response,
+    db: Session = Depends(get_db),
+):
     patient = db.query(Patient).filter(Patient.email == form.username).first()
     if not patient or not pwd_context.verify(form.password, patient.hashed_password):
-        write_structured_log("/auth/token", "login", "failed", request)
+        write_structured_log("/v1/auth/token", "login", "failed", request)
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     token = create_access_token({"sub": str(patient.id)})
-    _write_audit(db, "/auth/token", "login", "success", str(patient.id), str(patient.id), request.client.host if request.client else None)
-    write_structured_log("/auth/token", "login", "success", request, str(patient.id))
-    return Token(access_token=token)
+    _set_auth_cookie(response, token)
+    _write_audit(db, "/v1/auth/token", "login", "success", str(patient.id), str(patient.id), request.client.host if request.client else None)
+    write_structured_log("/v1/auth/token", "login", "success", request, str(patient.id))
+    return LoginResponse(patient_id=str(patient.id))
 
 
-@app.post("/patients/intake", response_model=IntakeResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/auth/logout")
+def logout(response: Response):
+    response.delete_cookie(
+        key="patient_access_token",
+        path="/",
+        domain="localhost",
+        samesite="none",
+        secure=True,
+    )
+    return {"status": "logged out"}
+
+
+@router.post("/patients/intake", response_model=IntakeResponse, status_code=status.HTTP_201_CREATED)
 def submit_intake(
     body: IntakeCreate,
     request: Request,
@@ -127,12 +189,12 @@ def submit_intake(
         logger.error("DB error on intake: %s", exc)
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
 
-    _write_audit(db, "/patients/intake", "intake_submit", "success", str(current_patient.id), str(current_patient.id), request.client.host if request.client else None)
-    write_structured_log("/patients/intake", "intake_submit", "success", request, str(current_patient.id))
+    _write_audit(db, "/v1/patients/intake", "intake_submit", "success", str(current_patient.id), str(current_patient.id), request.client.host if request.client else None)
+    write_structured_log("/v1/patients/intake", "intake_submit", "success", request, str(current_patient.id))
     return IntakeResponse.model_validate(intake)
 
 
-@app.get("/patients/{patient_id}", response_model=PatientResponse)
+@router.get("/patients/{patient_id}", response_model=PatientResponse)
 def get_patient(
     patient_id: str,
     request: Request,
@@ -156,8 +218,8 @@ def get_patient(
         except ValueError:
             dob_decrypted = None
 
-    _write_audit(db, f"/patients/{patient_id}", "patient_read", "success", str(current_patient.id), str(current_patient.id), request.client.host if request.client else None)
-    write_structured_log(f"/patients/{patient_id}", "patient_read", "success", request, str(current_patient.id))
+    _write_audit(db, f"/v1/patients/{patient_id}", "patient_read", "success", str(current_patient.id), str(current_patient.id), request.client.host if request.client else None)
+    write_structured_log(f"/v1/patients/{patient_id}", "patient_read", "success", request, str(current_patient.id))
 
     return PatientResponse(
         id=current_patient.id,
@@ -169,6 +231,9 @@ def get_patient(
         created_at=current_patient.created_at,
         intake=IntakeResponse.model_validate(intake) if intake else None,
     )
+
+
+app.include_router(router)
 
 
 @app.get("/health")

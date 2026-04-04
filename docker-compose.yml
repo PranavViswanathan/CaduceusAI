@@ -35,6 +35,46 @@ services:
       - ollama_data:/root/.ollama
     ports:
       - "11434:11434"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:11434/api/tags || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # Pulls required LLM models on first boot; skipped if already cached in the volume.
+  ollama-init:
+    image: ollama/ollama
+    volumes:
+      - ollama_data:/root/.ollama
+    depends_on:
+      ollama:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "
+        echo 'Pulling llama3...' &&
+        ollama pull llama3 --host http://ollama:11434 &&
+        echo 'Pulling mistral...' &&
+        ollama pull mistral --host http://ollama:11434 &&
+        echo 'Models ready.'
+      "
+    restart: "no"
+
+  # Runs Alembic migrations before the API services start.
+  migrate:
+    build: ./services/patient_api
+    command: >
+      sh -c "pip install alembic psycopg2-binary --quiet &&
+             cd /migrations &&
+             alembic upgrade head"
+    volumes:
+      - ./alembic:/migrations/alembic
+      - ./alembic.ini:/migrations/alembic.ini
+    env_file: .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
 
   patient-api:
     build: ./services/patient_api
@@ -46,6 +86,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     volumes:
       - ./data:/app/data
     restart: on-failure
@@ -60,6 +102,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     volumes:
       - ./data:/app/data
     restart: on-failure
@@ -74,6 +118,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     volumes:
       - ./data:/app/data
     restart: on-failure

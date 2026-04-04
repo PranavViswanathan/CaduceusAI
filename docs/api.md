@@ -8,13 +8,15 @@ Interactive Swagger docs are available when the stack is running:
 | Doctor API | http://localhost:8002/docs |
 | PostCare API | http://localhost:8003/docs |
 
+All endpoints are versioned under the `/v1/` prefix. Authentication is cookie-based — the login endpoint sets an httpOnly cookie that the browser sends automatically. Swagger UI's Authorize button (Bearer token fallback) still works for interactive testing.
+
 ---
 
 ## Patient API (port 8001)
 
 ### Authentication
 
-#### `POST /auth/register`
+#### `POST /v1/auth/register`
 
 Create a patient account.
 
@@ -30,6 +32,8 @@ Create a patient account.
 }
 ```
 
+Validation rules: `dob` must be `YYYY-MM-DD`; `sex` must be one of `male`, `female`, `other`, `prefer_not_to_say`; `name` 2–100 characters; `password` minimum 8 characters.
+
 **Response** `201`:
 ```json
 {
@@ -41,9 +45,9 @@ Create a patient account.
 
 ---
 
-#### `POST /auth/token`
+#### `POST /v1/auth/token`
 
-Login and receive a JWT. Uses OAuth2 password form fields.
+Login and receive an httpOnly session cookie. Uses OAuth2 password form fields.
 
 **Request** (form data):
 ```
@@ -51,21 +55,34 @@ username=patient@example.com
 password=Password123
 ```
 
-**Response** `200`:
+**Response** `200` — sets `patient_access_token` httpOnly cookie; body:
 ```json
 {
-  "access_token": "<jwt>",
-  "token_type": "bearer"
+  "patient_id": "<uuid>",
+  "token_type": "cookie"
 }
+```
+
+Rate limited to **5 requests/minute per IP**.
+
+---
+
+#### `POST /v1/auth/logout`
+
+Clear the session cookie.
+
+**Response** `200`:
+```json
+{ "message": "Logged out" }
 ```
 
 ---
 
 ### Patients
 
-#### `POST /patients/intake`
+#### `POST /v1/patients/intake`
 
-Submit a health intake. Requires `Authorization: Bearer <token>`.
+Submit a health intake. Requires authenticated session (cookie or `Authorization: Bearer`).
 
 **Request body**:
 ```json
@@ -80,6 +97,8 @@ Submit a health intake. Requires `Authorization: Bearer <token>`.
 }
 ```
 
+`symptoms` must be 10–5000 characters.
+
 **Response** `201`:
 ```json
 {
@@ -91,9 +110,9 @@ Submit a health intake. Requires `Authorization: Bearer <token>`.
 
 ---
 
-#### `GET /patients/{patient_id}`
+#### `GET /v1/patients/{patient_id}`
 
-Retrieve patient profile and latest intake. Token must belong to the same patient (self-only).
+Retrieve patient profile and latest intake. Session must belong to the same patient (self-only).
 
 **Response** `200`:
 ```json
@@ -132,11 +151,11 @@ or `503`:
 
 ## Doctor API (port 8002)
 
-All endpoints under `/doctor/` require `Authorization: Bearer <token>` where the token carries `role="doctor"`.
+All endpoints under `/v1/doctor/` require a `doctor_access_token` httpOnly cookie (or `Authorization: Bearer` fallback) where the token carries `role="doctor"`.
 
 ### Authentication
 
-#### `POST /auth/register`
+#### `POST /v1/auth/register`
 
 Register a doctor account.
 
@@ -157,20 +176,33 @@ Register a doctor account.
 
 ---
 
-#### `POST /auth/token`
+#### `POST /v1/auth/token`
 
-Doctor login. Same OAuth2 password form as patient API.
+Doctor login. Sets `doctor_access_token` httpOnly cookie.
 
 **Response** `200`:
 ```json
-{ "access_token": "<jwt>", "token_type": "bearer" }
+{ "doctor_id": "<uuid>", "token_type": "cookie" }
+```
+
+Rate limited to **5 requests/minute per IP**.
+
+---
+
+#### `POST /v1/auth/logout`
+
+Clear the doctor session cookie.
+
+**Response** `200`:
+```json
+{ "message": "Logged out" }
 ```
 
 ---
 
 ### Patients
 
-#### `GET /doctor/patients`
+#### `GET /v1/doctor/patients`
 
 List all patients with their latest intake timestamp.
 
@@ -188,7 +220,7 @@ List all patients with their latest intake timestamp.
 
 ---
 
-#### `GET /doctor/patients/{patient_id}/risk`
+#### `GET /v1/doctor/patients/{patient_id}/risk`
 
 Retrieve (or generate) an AI risk assessment for a patient.
 
@@ -213,9 +245,9 @@ Flow: check Redis cache → call Ollama → fall back to rule-based → store + 
 
 ---
 
-#### `POST /doctor/patients/{patient_id}/feedback`
+#### `POST /v1/doctor/patients/{patient_id}/feedback`
 
-Submit clinician feedback on a risk assessment.
+Submit clinician feedback on a risk assessment. Also invalidates the Redis cache for this patient's risk assessment (`risk:{patient_id}`).
 
 **Request body**:
 ```json
@@ -226,7 +258,7 @@ Submit clinician feedback on a risk assessment.
 }
 ```
 
-`action` must be one of: `agree`, `override`, `flag`.
+`action` must be one of: `agree`, `override`, `flag`. `reason` is required for `override` and `flag` (1–2000 characters).
 
 **Response** `201`:
 ```json
@@ -239,7 +271,7 @@ If `action` is `override` or `flag`, the feedback is also pushed to the Redis `r
 
 ### Escalations
 
-#### `GET /escalations/pending`
+#### `GET /v1/escalations/pending`
 
 Returns all unacknowledged escalations.
 
@@ -260,7 +292,7 @@ Returns all unacknowledged escalations.
 
 ### Internal Endpoints
 
-#### `POST /doctor/retrain/trigger`
+#### `POST /v1/doctor/retrain/trigger`
 
 Drain the Redis retrain queue to `data/retrain_buffer.jsonl`. Requires `X-Internal-Key` header.
 
@@ -281,7 +313,7 @@ Same format as patient-api health response.
 
 ### Care Plans
 
-#### `POST /careplan/generate`
+#### `POST /v1/careplan/generate`
 
 Generate a structured care plan from visit notes. Requires `X-Internal-Key` header (internal service call only).
 
@@ -292,6 +324,8 @@ Generate a structured care plan from visit notes. Requires `X-Internal-Key` head
   "visit_notes": "Patient presents with controlled T2DM. Adjust Metformin to 1000mg BD. Follow up in 2 weeks."
 }
 ```
+
+`visit_notes` must be 1–10000 characters.
 
 **Response** `201`:
 ```json
@@ -308,9 +342,9 @@ Generate a structured care plan from visit notes. Requires `X-Internal-Key` head
 
 ---
 
-#### `GET /careplan/{patient_id}`
+#### `GET /v1/careplan/{patient_id}`
 
-Retrieve the latest care plan for a patient. Requires doctor JWT.
+Retrieve the latest care plan for a patient. Requires authenticated doctor session.
 
 **Response** `200`: same shape as the create response.
 
@@ -318,9 +352,9 @@ Retrieve the latest care plan for a patient. Requires doctor JWT.
 
 ### Follow-up Check-ins
 
-#### `POST /followup/checkin`
+#### `POST /v1/followup/checkin`
 
-Patient submits a symptom report. Urgency is assessed automatically.
+Patient submits a symptom report. Urgency is assessed automatically. Requires patient or doctor session.
 
 **Request body**:
 ```json
@@ -329,6 +363,8 @@ Patient submits a symptom report. Urgency is assessed automatically.
   "symptom_report": "I have a fever of 102°F and feel very dizzy."
 }
 ```
+
+`symptom_report` must be 10–5000 characters.
 
 **Response** `201`:
 ```json
@@ -348,17 +384,17 @@ If `urgency == "escalate"`: an `Escalation` row is created and pushed to Redis `
 
 ### Escalations
 
-#### `GET /escalations/pending`
+#### `GET /v1/escalations/pending`
 
-Unacknowledged escalations. Requires doctor JWT. Polled by doctor portal every 60 seconds.
+Unacknowledged escalations. Requires doctor session. Polled by doctor portal every 60 seconds.
 
 **Response** `200`: list of escalation objects.
 
 ---
 
-#### `POST /escalations/{escalation_id}/acknowledge`
+#### `POST /v1/escalations/{escalation_id}/acknowledge`
 
-Mark an escalation as acknowledged. Requires doctor JWT.
+Mark an escalation as acknowledged. Requires doctor session.
 
 **Response** `200`:
 ```json
@@ -384,10 +420,11 @@ All APIs return consistent error shapes:
 | Code | Meaning |
 |---|---|
 | `400` | Validation error (Pydantic) |
-| `401` | Missing, expired, or invalid JWT |
+| `401` | Missing, expired, or invalid session |
 | `403` | Correct format but wrong role or missing `X-Internal-Key` |
 | `404` | Resource not found |
 | `409` | Conflict (e.g. email already registered) |
+| `429` | Rate limit exceeded |
 | `503` | Database or downstream dependency unavailable |
 
 ```json

@@ -3,7 +3,7 @@
 import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { submitIntake, MedicationItem } from '@/lib/api'
-import { getToken, getPatientId } from '@/lib/auth'
+import { getPatientId } from '@/lib/auth'
 
 type FormState = {
   conditions: string[]
@@ -26,7 +26,7 @@ export default function IntakePage() {
   const [apiError, setApiError] = useState('')
 
   useEffect(() => {
-    if (!getToken()) router.replace('/login')
+    if (!getPatientId()) router.replace('/login')
   }, [router])
 
   function addCondition() {
@@ -85,10 +85,8 @@ export default function IntakePage() {
     if (!validateStep()) return
     setSubmitting(true)
     setApiError('')
-    const token = getToken()
-    if (!token) { router.replace('/login'); return }
     try {
-      await submitIntake(form, token)
+      await submitIntake(form)
       router.push('/dashboard')
     } catch (err) {
       setApiError(err instanceof Error ? err.message : 'Submission failed')
@@ -119,7 +117,7 @@ export default function IntakePage() {
             <div className="mb-4 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">{apiError}</div>
           )}
 
-          {/* Step 1: Demographics placeholder (data comes from registration) */}
+          {/* Step 1: Demographics placeholder */}
           {step === 1 && (
             <div className="space-y-4">
               <div className="p-4 bg-blue-50 rounded-lg">

@@ -4,7 +4,7 @@ import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { getPatient, getCarePlan, PatientData, CarePlanData } from '@/lib/api'
-import { getToken, getPatientId, clearAuth } from '@/lib/auth'
+import { getPatientId, logout } from '@/lib/auth'
 
 export default function DashboardPage() {
   const router = useRouter()
@@ -14,21 +14,20 @@ export default function DashboardPage() {
   const [error, setError] = useState('')
 
   useEffect(() => {
-    const token = getToken()
     const patientId = getPatientId()
-    if (!token || !patientId) { router.replace('/login'); return }
+    if (!patientId) { router.replace('/login'); return }
 
     Promise.all([
-      getPatient(patientId, token),
-      getCarePlan(patientId, token),
+      getPatient(patientId),
+      getCarePlan(patientId),
     ])
       .then(([p, cp]) => { setPatient(p); setCarePlan(cp) })
       .catch(err => setError(err instanceof Error ? err.message : 'Failed to load records'))
       .finally(() => setLoading(false))
   }, [router])
 
-  function handleLogout() {
-    clearAuth()
+  async function handleLogout() {
+    await logout()
     router.push('/')
   }
 

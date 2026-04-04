@@ -60,66 +60,52 @@ async function handleResponse<T>(res: Response): Promise<T> {
   return res.json() as Promise<T>
 }
 
-export async function loginDoctor(email: string, password: string): Promise<{ access_token: string }> {
+export async function loginDoctor(email: string, password: string): Promise<{ doctor_id: string }> {
   const form = new URLSearchParams({ username: email, password })
-  const res = await fetch(`${DOCTOR_API}/auth/token`, {
+  const res = await fetch(`${DOCTOR_API}/v1/auth/token`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    credentials: 'include',
     body: form.toString(),
   })
   return handleResponse(res)
 }
 
-export async function getPatients(token: string): Promise<PatientListItem[]> {
-  const res = await fetch(`${DOCTOR_API}/doctor/patients`, {
-    headers: { Authorization: `Bearer ${token}` },
+export async function getPatients(): Promise<PatientListItem[]> {
+  const res = await fetch(`${DOCTOR_API}/v1/doctor/patients`, {
+    credentials: 'include',
   })
   return handleResponse(res)
 }
 
-export async function getPatientRisk(patientId: string, token: string): Promise<RiskAssessment> {
-  const res = await fetch(`${DOCTOR_API}/doctor/patients/${patientId}/risk`, {
-    headers: { Authorization: `Bearer ${token}` },
+export async function getPatientRisk(patientId: string): Promise<RiskAssessment> {
+  const res = await fetch(`${DOCTOR_API}/v1/doctor/patients/${patientId}/risk`, {
+    credentials: 'include',
   })
   return handleResponse(res)
 }
 
-export async function getPatientDetail(patientId: string, token: string): Promise<PatientDetail> {
-  const res = await fetch(`${DOCTOR_API}/doctor/patients/${patientId}/risk`, {
-    headers: { Authorization: `Bearer ${token}` },
-  })
-  // We get patient detail from the patients list endpoint + risk endpoint
-  // For patient detail, we'll use the patients list and filter, or fetch from patient API
-  // Actually, the doctor API doesn't have a dedicated GET /doctor/patients/{id} endpoint,
-  // so we'll compose from available data. The risk endpoint triggers the patient fetch internally.
-  // For display purposes, we'll add a separate route call to GET /doctor/patients and filter.
-  if (!res.ok) throw new Error(`Failed to fetch patient: ${res.status}`)
-  return res.json()
-}
-
-export async function submitFeedback(patientId: string, feedback: FeedbackPayload, token: string): Promise<void> {
-  const res = await fetch(`${DOCTOR_API}/doctor/patients/${patientId}/feedback`, {
+export async function submitFeedback(patientId: string, feedback: FeedbackPayload): Promise<void> {
+  const res = await fetch(`${DOCTOR_API}/v1/doctor/patients/${patientId}/feedback`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${token}`,
-    },
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
     body: JSON.stringify(feedback),
   })
   return handleResponse(res)
 }
 
-export async function getPendingEscalations(token: string): Promise<Escalation[]> {
-  const res = await fetch(`${DOCTOR_API}/escalations/pending`, {
-    headers: { Authorization: `Bearer ${token}` },
+export async function getPendingEscalations(): Promise<Escalation[]> {
+  const res = await fetch(`${DOCTOR_API}/v1/escalations/pending`, {
+    credentials: 'include',
   })
   return handleResponse(res)
 }
 
-export async function acknowledgeEscalation(escalationId: string, token: string): Promise<void> {
-  const res = await fetch(`${POSTCARE_API}/escalations/${escalationId}/acknowledge`, {
+export async function acknowledgeEscalation(escalationId: string): Promise<void> {
+  const res = await fetch(`${POSTCARE_API}/v1/escalations/${escalationId}/acknowledge`, {
     method: 'POST',
-    headers: { Authorization: `Bearer ${token}` },
+    credentials: 'include',
   })
   return handleResponse(res)
 }

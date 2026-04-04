@@ -7,7 +7,7 @@ import {
   getPatients, getPatientRisk, submitFeedback,
   PatientListItem, RiskAssessment, FeedbackPayload
 } from '@/lib/api'
-import { getToken, getDoctorId } from '@/lib/auth'
+import { getDoctorId } from '@/lib/auth'
 
 const POLL_INTERVAL = 60
 
@@ -36,12 +36,10 @@ export default function PatientDetailPage() {
   const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const fetchRisk = useCallback(async () => {
-    const token = getToken()
-    if (!token) return
     setLoadingRisk(true)
     setRiskError(false)
     try {
-      const data = await getPatientRisk(patientId, token)
+      const data = await getPatientRisk(patientId)
       setRisk(data)
     } catch {
       setRiskError(true)
@@ -51,11 +49,10 @@ export default function PatientDetailPage() {
   }, [patientId])
 
   useEffect(() => {
-    const token = getToken()
-    if (!token) { router.replace('/login'); return }
+    if (!getDoctorId()) { router.replace('/login'); return }
 
     // Load patient from list
-    getPatients(token).then(list => {
+    getPatients().then(list => {
       const found = list.find(p => p.id === patientId) || null
       setPatient(found)
     }).catch(() => {}).finally(() => setLoadingPatient(false))
@@ -87,9 +84,8 @@ export default function PatientDetailPage() {
       setFeedbackError('Please provide your clinical reasoning')
       return
     }
-    const token = getToken()
     const doctorId = getDoctorId()
-    if (!token || !doctorId) { router.replace('/login'); return }
+    if (!doctorId) { router.replace('/login'); return }
 
     setFeedbackSubmitting(true)
     setFeedbackError('')
@@ -100,7 +96,7 @@ export default function PatientDetailPage() {
         doctor_id: doctorId,
         assessment_id: risk?.id,
       }
-      await submitFeedback(patientId, payload, token)
+      await submitFeedback(patientId, payload)
       setFeedbackSuccess(true)
       setTimeout(() => setFeedbackSuccess(false), 4000)
       setFeedbackAction(null)
@@ -146,8 +142,6 @@ export default function PatientDetailPage() {
               )}
             </div>
 
-            {/* Note: Full patient detail (conditions/medications) would require a dedicated GET endpoint.
-                Currently the doctor_api returns these from the risk endpoint. For now we show available data. */}
             <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
               <p className="text-xs font-semibold text-slate-500 uppercase tracking-wide mb-3">Record Details</p>
               <p className="text-sm text-slate-500 italic">

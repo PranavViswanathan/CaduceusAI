@@ -1,9 +1,10 @@
 import json
 import logging
+import os
 from typing import Annotated
 
 import redis as redis_lib
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
@@ -19,6 +20,8 @@ from settings import settings
 
 logger = logging.getLogger(__name__)
 
+_TESTING = os.getenv("TESTING", "false").lower() == "true"
+
 app = FastAPI(title="PostCare API", version="1.0.0")
 
 app.add_middleware(
@@ -29,9 +32,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+router = APIRouter(prefix="/v1")
+
 
 @app.on_event("startup")
 def on_startup() -> None:
+    if _TESTING:
+        return
     Base.metadata.create_all(bind=engine)
 
 
@@ -58,7 +65,7 @@ def _require_internal_key(x_internal_key: Annotated[str | None, Header()] = None
         raise HTTPException(status_code=403, detail="Forbidden")
 
 
-@app.post("/careplan/generate", response_model=CarePlanResponse, status_code=201)
+@router.post("/careplan/generate", response_model=CarePlanResponse, status_code=201)
 async def create_care_plan(
     body: CarePlanCreate,
     request: Request,
@@ -91,12 +98,12 @@ async def create_care_plan(
         db.rollback()
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
 
-    _write_audit(db, "/careplan/generate", "careplan_generate", "success", patient_id=body.patient_id, ip=request.client.host if request.client else None)
-    write_structured_log("/careplan/generate", "careplan_generate", "success", request, patient_id=body.patient_id)
+    _write_audit(db, "/v1/careplan/generate", "careplan_generate", "success", patient_id=body.patient_id, ip=request.client.host if request.client else None)
+    write_structured_log("/v1/careplan/generate", "careplan_generate", "success", request, patient_id=body.patient_id)
     return CarePlanResponse.model_validate(plan)
 
 
-@app.get("/careplan/{patient_id}", response_model=CarePlanResponse)
+@router.get("/careplan/{patient_id}", response_model=CarePlanResponse)
 def get_care_plan(
     patient_id: str,
     request: Request,
@@ -116,12 +123,12 @@ def get_care_plan(
     if not plan:
         raise HTTPException(status_code=404, detail="No care plan found for this patient")
 
-    _write_audit(db, f"/careplan/{patient_id}", "careplan_read", "success", actor_id=user.get("sub"), patient_id=patient_id, ip=request.client.host if request.client else None)
-    write_structured_log(f"/careplan/{patient_id}", "careplan_read", "success", request, user.get("sub"), patient_id)
+    _write_audit(db, f"/v1/careplan/{patient_id}", "careplan_read", "success", actor_id=user.get("sub"), patient_id=patient_id, ip=request.client.host if request.client else None)
+    write_structured_log(f"/v1/careplan/{patient_id}", "careplan_read", "success", request, user.get("sub"), patient_id)
     return CarePlanResponse.model_validate(plan)
 
 
-@app.post("/followup/checkin", response_model=CheckinResponse, status_code=201)
+@router.post("/followup/checkin", response_model=CheckinResponse, status_code=201)
 async def checkin(
     body: CheckinCreate,
     request: Request,
@@ -181,12 +188,12 @@ async def checkin(
             except Exception as exc:
                 logger.warning("Redis escalation queue push failed: %s", exc)
 
-    _write_audit(db, "/followup/checkin", "checkin_submit", "success", actor_id=user.get("sub"), patient_id=body.patient_id, ip=request.client.host if request.client else None)
-    write_structured_log("/followup/checkin", "checkin_submit", "success", request, user.get("sub"), body.patient_id)
+    _write_audit(db, "/v1/followup/checkin", "checkin_submit", "success", actor_id=user.get("sub"), patient_id=body.patient_id, ip=request.client.host if request.client else None)
+    write_structured_log("/v1/followup/checkin", "checkin_submit", "success", request, user.get("sub"), body.patient_id)
     return CheckinResponse.model_validate(checkin_record)
 
 
-@app.get("/escalations/pending")
+@router.get("/escalations/pending")
 def pending_escalations(
     request: Request,
     user: dict = Depends(require_doctor),
@@ -199,7 +206,7 @@ def pending_escalations(
     return [EscalationResponse.model_validate(e) for e in escalations]
 
 
-@app.post("/escalations/{escalation_id}/acknowledge")
+@router.post("/escalations/{escalation_id}/acknowledge")
 def acknowledge_escalation(
     escalation_id: str,
     request: Request,
@@ -217,8 +224,11 @@ def acknowledge_escalation(
         db.rollback()
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
 
-    _write_audit(db, f"/escalations/{escalation_id}/acknowledge", "escalation_acknowledged", "success", actor_id=user.get("sub"), ip=request.client.host if request.client else None)
+    _write_audit(db, f"/v1/escalations/{escalation_id}/acknowledge", "escalation_acknowledged", "success", actor_id=user.get("sub"), ip=request.client.host if request.client else None)
     return {"status": "acknowledged"}
+
+
+app.include_router(router)
 
 
 @app.get("/health")

@@ -4,6 +4,16 @@ Both portals are built with **Next.js 14** (App Router), **React 18**, **TypeScr
 
 ---
 
+## Authentication Pattern
+
+Authentication is **cookie-based**. On login, the backend sets an httpOnly cookie (`patient_access_token` or `doctor_access_token`) that the browser sends automatically on every subsequent request. The JWT is never accessible to JavaScript.
+
+All `fetch` calls include `credentials: 'include'` to ensure cookies are sent on cross-origin requests to the API ports. No `Authorization` headers are constructed or stored by the frontend.
+
+The only value stored in `localStorage` is the user's ID (e.g. `patientId`, `doctorId`) for use in constructing API URLs and displaying the user's name.
+
+---
+
 ## Patient Portal (port 3000)
 
 ### Tech Stack
@@ -33,7 +43,7 @@ Form fields:
 - Sex (dropdown)
 - Phone
 
-On submit: `POST /auth/register` → redirect to `/login`.
+On submit: `POST /v1/auth/register` → redirect to `/login`.
 
 ---
 
@@ -43,7 +53,7 @@ Form fields:
 - Email
 - Password
 
-On submit: `POST /auth/token` → stores `access_token` and `patient_id` in `localStorage` → redirects to `/intake` (first time) or `/dashboard`.
+On submit: `POST /v1/auth/token` → backend sets `patient_access_token` cookie → stores `patient_id` from response body in `localStorage` → redirects to `/intake` (first time) or `/dashboard`.
 
 ---
 
@@ -59,7 +69,7 @@ Each step is a separate screen within the same page component. Navigation is cli
 | 4 — Allergies | Add / remove allergy strings |
 | 5 — Symptoms | Free-text area |
 
-On submit: `POST /patients/intake` → redirect to `/dashboard`.
+On submit: `POST /v1/patients/intake` → redirect to `/dashboard`.
 
 ---
 
@@ -67,34 +77,36 @@ On submit: `POST /patients/intake` → redirect to `/dashboard`.
 
 Three sections, loaded in parallel on mount:
 
-1. **Profile** — `GET /patients/{patient_id}`: name, email, decrypted DOB, phone
+1. **Profile** — `GET /v1/patients/{patient_id}`: name, email, decrypted DOB, phone
 2. **Latest Intake** — rendered from profile response: conditions, medications, allergies, symptoms, submission timestamp
-3. **Care Plan** — `GET /careplan/{patient_id}` (postcare-api): follow-up date, medications to monitor, lifestyle recommendations, warning signs
+3. **Care Plan** — `GET /v1/careplan/{patient_id}` (postcare-api): follow-up date, medications to monitor, lifestyle recommendations, warning signs
 
 ---
 
-### API Client (`src/app/lib/api.ts`)
+### API Client (`src/lib/api.ts`)
 
 ```typescript
 register(data: PatientRegisterData): Promise<Patient>
-login(email: string, password: string): Promise<{ access_token: string }>
-submitIntake(data: IntakeData, token: string): Promise<IntakeResponse>
-getPatientProfile(patientId: string, token: string): Promise<PatientProfile>
-getCarePlan(patientId: string, token: string): Promise<CarePlan | null>
+loginPatient(email: string, password: string): Promise<{ patient_id: string }>
+submitIntake(data: IntakeData): Promise<IntakeResponse>
+getPatient(patientId: string): Promise<PatientProfile>
+getCarePlan(patientId: string): Promise<CarePlan | null>
 ```
 
-All calls include `Authorization: Bearer <token>` where required. Base URL is read from `process.env.NEXT_PUBLIC_PATIENT_API_URL`.
+All calls include `credentials: 'include'`. No token parameters — the cookie is sent automatically. Base URL is read from `process.env.NEXT_PUBLIC_PATIENT_API_URL`.
 
 ---
 
-### Auth Helper (`src/app/lib/auth.ts`)
+### Auth Helper (`src/lib/auth.ts`)
 
 ```typescript
-setAuth(token: string, patientId: string): void     // writes to localStorage
-getToken(): string | null
+savePatientId(patientId: string): void   // writes patient_id to localStorage
 getPatientId(): string | null
-clearAuth(): void                                    // logout
+clearAuth(): void                         // removes patient_id from localStorage
+logout(): Promise<void>                   // calls POST /v1/auth/logout, then clearAuth()
 ```
+
+`logout()` is async — it calls the backend to clear the httpOnly cookie before removing the local ID.
 
 ---
 
@@ -104,18 +116,18 @@ clearAuth(): void                                    // logout
 
 #### `/login` — Doctor Login
 
-Same UI pattern as patient login. On success: stores JWT and `doctor_id` in `localStorage`, redirects to `/patients`.
+On success: backend sets `doctor_access_token` cookie; `doctor_id` from response body is stored in `localStorage`. Redirects to `/patients`.
 
 ---
 
 #### `/patients` — Patient List
 
-Displays all patients returned by `GET /doctor/patients`:
+Displays all patients returned by `GET /v1/doctor/patients`:
 - Patient name, email
 - Last intake timestamp
 - "View" link → `/patients/[id]`
 
-**Escalation alert banner**: At the top of the page, a red banner appears if `GET /escalations/pending` (postcare-api) returns one or more unacknowledged escalations. The banner shows the count and a link to review.
+**Escalation alert banner**: At the top of the page, a red banner appears if `GET /v1/escalations/pending` (postcare-api) returns one or more unacknowledged escalations. The banner shows the count and a link to review.
 
 Polling: the escalation check runs immediately on mount and repeats every **60 seconds** via `setInterval`.
 
@@ -136,7 +148,7 @@ Three sections:
 
 **3. AI Risk Assessment Panel**
 
-Loaded from `GET /doctor/patients/{id}/risk`:
+Loaded from `GET /v1/doctor/patients/{id}/risk`:
 
 - **Risk list**: bullet points of identified clinical risks
 - **Confidence badge**: colour-coded (`low` = red, `medium` = amber, `high` = green)
@@ -154,21 +166,22 @@ Reason (optional):
 [ Submit Feedback ]
 ```
 
-On submit: `POST /doctor/patients/{id}/feedback`. If `override` or `flag`, the event is queued in Redis for the retraining loop.
+On submit: `POST /v1/doctor/patients/{id}/feedback` with `doctor_id` from `localStorage`. If `override` or `flag`, the event is queued in Redis for the retraining loop, and the patient's risk cache is invalidated.
 
 ---
 
-### API Client (`src/app/lib/api.ts`)
+### API Client (`src/lib/api.ts`)
 
 ```typescript
-loginDoctor(email: string, password: string): Promise<{ access_token: string }>
-getPatients(token: string): Promise<Patient[]>
-getPatientProfile(patientId: string, token: string): Promise<PatientProfile>
-getRiskAssessment(patientId: string, token: string): Promise<RiskAssessment>
-submitFeedback(patientId: string, data: FeedbackData, token: string): Promise<void>
-getPendingEscalations(token: string): Promise<Escalation[]>
-acknowledgeEscalation(escalationId: string, token: string): Promise<void>
+loginDoctor(email: string, password: string): Promise<{ doctor_id: string }>
+getPatients(): Promise<Patient[]>
+getPatientRisk(patientId: string): Promise<RiskAssessment>
+submitFeedback(patientId: string, data: FeedbackData): Promise<void>
+getPendingEscalations(): Promise<Escalation[]>
+acknowledgeEscalation(escalationId: string): Promise<void>
 ```
+
+All calls include `credentials: 'include'`. No token parameters.
 
 Base URLs:
 - Doctor API calls: `NEXT_PUBLIC_DOCTOR_API_URL` (default `http://localhost:8002`)
@@ -176,13 +189,13 @@ Base URLs:
 
 ---
 
-### Auth Helper (`src/app/lib/auth.ts`)
+### Auth Helper (`src/lib/auth.ts`)
 
 ```typescript
-setAuth(token: string, doctorId: string): void
-getToken(): string | null
+saveDoctorId(doctorId: string): void
 getDoctorId(): string | null
 clearAuth(): void
+logout(): Promise<void>   // calls POST /v1/auth/logout, then clearAuth()
 ```
 
 ---
@@ -197,9 +210,9 @@ All `fetch` calls are inside `useEffect` hooks in client components (`"use clien
 
 API errors are caught in `try/catch` blocks. On 401, both portals call `clearAuth()` and redirect to `/login`. Other errors display an inline error message.
 
-### Token Storage
+### Cookie Sharing Across Ports
 
-JWTs are stored in `localStorage`. This is convenient for a local development environment but `httpOnly` cookies are recommended for any deployment where real patient data is processed.
+Because cookies are scoped to `domain=localhost` (without a port), the `patient_access_token` set by `patient-api` on `:8001` is automatically sent by the browser to `postcare-api` on `:8003`. This allows the patient portal's check-in calls to work without any additional auth steps.
 
 ### Environment Variables
 
