@@ -35,6 +35,18 @@ In Docker, the `migrate` service handles this automatically on every `docker com
 docker compose run --rm migrate
 ```
 
+If the tables already exist but `alembic_version` is missing (e.g. the DB was seeded outside of Alembic), stamp the current revision without re-running DDL:
+
+```bash
+docker run --rm \
+  --network medical-ai-platform_default \
+  --env-file .env \
+  -v $(pwd)/alembic:/migrations/alembic \
+  -v $(pwd)/alembic.ini:/migrations/alembic.ini \
+  python:3.11-slim \
+  sh -c "pip install alembic psycopg2-binary -q && cd /migrations && alembic stamp 001"
+```
+
 ---
 
 ## Tables

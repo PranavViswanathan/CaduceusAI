@@ -87,7 +87,7 @@ Docker Compose handles the complete startup sequence automatically:
 
 1. **postgres** and **redis** start and pass health checks
 2. **migrate** runs `alembic upgrade head` to apply all schema migrations
-3. **ollama** starts; **ollama-init** pulls `llama3` and `mistral` (~4.7 GB + ~4.1 GB on first run — this may take several minutes)
+3. **ollama** starts; **ollama-init** pulls `llama3` and `mistral` (~4.7 GB + ~4.1 GB on first run — this may take several minutes). If `ollama-init` is slow or fails, models can be pulled manually (see Troubleshooting below).
 4. All three API services start once `migrate` completes
 5. Both frontend portals start
 
@@ -183,6 +183,47 @@ curl -X POST http://localhost:8002/v1/doctor/retrain/trigger \
 
 ---
 
+## Troubleshooting
+
+### `migrate` service exits with `DuplicateTable` error
+
+This happens if tables were created outside of Alembic (e.g. by a previous stack that didn't complete cleanly) but the `alembic_version` table is missing. Fix by stamping the current revision:
+
+```bash
+docker run --rm \
+  --network medical-ai-platform_default \
+  --env-file .env \
+  -v $(pwd)/alembic:/migrations/alembic \
+  -v $(pwd)/alembic.ini:/migrations/alembic.ini \
+  python:3.11-slim \
+  sh -c "pip install alembic psycopg2-binary -q && cd /migrations && alembic stamp 001"
+```
+
+Then restart:
+
+```bash
+docker compose up -d patient-api doctor-api postcare-api
+```
+
+### Ollama healthcheck fails (`curl: not found`)
+
+The `ollama/ollama` image does not include `curl`. The healthcheck uses `ollama list` instead — this is already set correctly in `docker-compose.yml`.
+
+### AI unavailable / rule-based fallback shown
+
+1. Confirm llama3 is pulled: `curl http://localhost:11434/api/tags`
+2. If the model list is empty, pull manually:
+   ```bash
+   docker compose exec ollama ollama pull llama3
+   ```
+3. If the model is present but the portal still shows "AI unavailable", flush the Redis cache (a stale rule-based result may be cached):
+   ```bash
+   docker compose exec redis redis-cli FLUSHALL
+   ```
+4. The first AI assessment after a cold start takes 30–90 s on CPU — this is normal.
+
+---
+
 ## Security Notes
 
 - All sensitive fields (DOB) are AES-256 encrypted at rest using Fernet
@@ -205,7 +246,7 @@ The `FERNET_KEY` in `.env` is used to encrypt sensitive patient fields before st
 
 ## Fault Tolerance
 
-- Every Ollama call has a 10-second timeout with automatic fallback to rule-based assessment
+- Every Ollama call has a 120-second timeout with automatic fallback to rule-based assessment (CPU inference of llama3 can take 30–90 s)
 - Redis failures are silent (cache miss, no caching)
 - PostgreSQL failures return HTTP 503 with a safe error message (no stack traces)
 - Each service exposes `GET /health` reporting DB + Redis status

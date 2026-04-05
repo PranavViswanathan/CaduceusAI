@@ -22,35 +22,30 @@ The platform uses **Ollama** for fully local LLM inference. No data ever leaves 
 
 ### Prompt Construction
 
-The function `get_risk_assessment()` builds a structured clinical decision support prompt:
+The function `get_risk_assessment()` builds a concise structured prompt designed to keep the model's output strictly JSON. Medication names only (no dose/frequency) are included to reduce output length and improve parse reliability:
 
 ```
-You are a clinical decision support AI.
-Given the following patient data, identify clinical risks.
+You are a clinical risk assessment tool. Reply with ONLY a JSON object — no prose, no markdown.
+Required format: {"risks":["short risk 1","short risk 2"],"confidence":"low","summary":"one sentence"}
+confidence must be exactly: low, medium, or high.
 
-Patient Data:
-- Conditions: {conditions}
-- Medications: {medications}
-- Allergies: {allergies}
-- Symptoms: {symptoms}
+Conditions: {conditions}
+Medications: {medication names}
+Allergies: {allergies}
+Symptoms: {symptoms}
 
-Return JSON only:
-{
-  "risks": ["risk1", "risk2"],
-  "confidence": "low|medium|high",
-  "summary": "brief clinical narrative"
-}
+JSON:
 ```
 
 ### Model Cascade
 
 1. Try `llama3` first (faster, recommended)
 2. On model-not-found error, retry with `mistral`
-3. Both attempts share the same 10-second async timeout (`httpx.AsyncClient`)
+3. Both attempts share a 120-second async timeout (`httpx.AsyncClient`) — CPU inference of llama3 typically takes 30–90 s
 
 ### JSON Extraction
 
-After receiving the raw Ollama response, the function uses regex to extract the first valid JSON object from the text (Ollama sometimes wraps JSON in markdown fences or adds prose). Extraction failures fall through to the rule-based fallback.
+After receiving the raw Ollama response, the function uses regex to extract the first valid `{...}` JSON object from the text. Control characters (except tabs, newlines, and carriage returns) are stripped before parsing to handle common LLM output quirks. Extraction or parse failures fall through to the rule-based fallback.
 
 ### Rule-Based Fallback
 
@@ -197,20 +192,24 @@ ollama-init:
 
 Model weights are stored in the `ollama_data` Docker volume. On subsequent `docker compose up` runs the volume already contains the weights, so `ollama-init` exits immediately without re-downloading.
 
+### Healthcheck
+
+The `ollama` service healthcheck uses `ollama list` rather than `curl`, because the `ollama/ollama` image does not include `curl`.
+
 ### Manual Pull (if needed)
 
 ```bash
 # Pull into a running stack
-docker exec -it medical-ai-platform-ollama-1 ollama pull llama3
-docker exec -it medical-ai-platform-ollama-1 ollama pull mistral
+docker compose exec ollama ollama pull llama3
+docker compose exec ollama ollama pull mistral
 ```
 
 ### Async HTTP Client
 
-All Ollama calls use `httpx.AsyncClient` with a 10-second timeout:
+All Ollama calls use `httpx.AsyncClient` with a 120-second timeout. The long timeout is necessary because CPU-only inference of llama3 (8 B parameters, Q4_0 quantisation) typically takes 30–90 s depending on host hardware.
 
 ```python
-async with httpx.AsyncClient(timeout=10.0) as client:
+async with httpx.AsyncClient(timeout=120.0) as client:
     response = await client.post(
         f"{settings.OLLAMA_URL}/api/generate",
         json={"model": "llama3", "prompt": prompt, "stream": False}

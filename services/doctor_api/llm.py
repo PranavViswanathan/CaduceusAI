@@ -65,36 +65,37 @@ def rule_based_assessment(patient_data: dict) -> dict:
 
 
 def _build_prompt(patient_data: dict) -> str:
-    conditions = ", ".join(patient_data.get("conditions", [])) or "None reported"
+    conditions = ", ".join(patient_data.get("conditions", [])) or "None"
     medications = "; ".join(
-        f"{m.get('name', '')} {m.get('dose', '')} {m.get('frequency', '')}"
-        if isinstance(m, dict) else str(m)
+        m.get("name", str(m)) if isinstance(m, dict) else str(m)
         for m in patient_data.get("medications", [])
-    ) or "None reported"
-    allergies = ", ".join(patient_data.get("allergies", [])) or "None reported"
-    symptoms = patient_data.get("symptoms") or "None reported"
+    ) or "None"
+    allergies = ", ".join(patient_data.get("allergies", [])) or "None"
+    symptoms = patient_data.get("symptoms") or "None"
 
     return (
-        "You are a clinical decision support system. Analyze the following patient data and return "
-        "a structured risk assessment as VALID JSON only. Do not include any text outside the JSON.\n\n"
-        f"Patient: {patient_data.get('name', 'Unknown')}\n"
+        "You are a clinical risk assessment tool. Reply with ONLY a JSON object — no prose, no markdown.\n"
+        "Required format: "
+        '{"risks":["short risk 1","short risk 2"],"confidence":"low","summary":"one sentence"}\n'
+        "confidence must be exactly: low, medium, or high.\n\n"
         f"Conditions: {conditions}\n"
-        f"Current Medications: {medications}\n"
+        f"Medications: {medications}\n"
         f"Allergies: {allergies}\n"
         f"Symptoms: {symptoms}\n\n"
-        "Return exactly this JSON structure:\n"
-        '{"risks": ["risk1", "risk2"], "confidence": "low|medium|high", "summary": "narrative summary"}\n\n'
-        "Confidence levels: high = clear clinical evidence, medium = some concern, low = minimal risk.\n"
-        "Be specific about drug interactions, contraindications, and symptom red flags."
+        "JSON:"
     )
 
 
 def _parse_llm_json(raw: str) -> dict:
     raw = raw.strip()
-    json_match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if json_match:
-        return json.loads(json_match.group())
-    return json.loads(raw)
+    # Extract the first {...} block
+    json_match = re.search(r"\{.*?\}", raw, re.DOTALL)
+    if not json_match:
+        json_match = re.search(r"\{.*\}", raw, re.DOTALL)
+    candidate = json_match.group() if json_match else raw
+    # Remove control characters that break JSON parsing
+    candidate = re.sub(r"[\x00-\x1f\x7f]", lambda m: " " if m.group() in "\t\n\r" else "", candidate)
+    return json.loads(candidate)
 
 
 async def get_risk_assessment(patient_data: dict) -> dict:
@@ -102,7 +103,7 @@ async def get_risk_assessment(patient_data: dict) -> dict:
 
     for model in ("llama3", "mistral"):
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=120.0) as client:
                 resp = await client.post(
                     f"{settings.OLLAMA_URL}/api/generate",
                     json={"model": model, "prompt": prompt, "stream": False},
