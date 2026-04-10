@@ -16,7 +16,7 @@ alembic/
     └── 001_initial_schema.py   # Creates all tables and indexes
 ```
 
-### Running migrations manually
+### Running migrations — local (Docker Compose)
 
 ```bash
 # Apply all pending migrations
@@ -29,7 +29,7 @@ DATABASE_URL=postgresql://user:pass@localhost:5432/medai alembic downgrade -1
 DATABASE_URL=postgresql://user:pass@localhost:5432/medai alembic current
 ```
 
-In Docker, the `migrate` service handles this automatically on every `docker compose up`. To run migrations against a running stack:
+The `migrate` service handles this automatically on every `docker compose up`. To run migrations against a running stack:
 
 ```bash
 docker compose run --rm migrate
@@ -46,6 +46,26 @@ docker run --rm \
   python:3.11-slim \
   sh -c "pip install alembic psycopg2-binary -q && cd /migrations && alembic stamp 001"
 ```
+
+### Running migrations — AWS (ECS one-shot task)
+
+In the AWS deployment, migrations are run as a one-shot ECS Fargate task using the `migrate` task definition created by Terraform. Run this after first deploy and after any schema change:
+
+```bash
+# Get values from Terraform outputs
+CLUSTER=$(terraform output -raw ecs_cluster_name)
+TASK_DEF=$(terraform output -raw migrate_task_definition_arn)
+SUBNET=$(terraform output -json private_subnet_ids | jq -r '.[0]')
+SG=$(terraform output -raw ecs_tasks_security_group_id)
+
+aws ecs run-task \
+  --cluster "$CLUSTER" \
+  --task-definition "$TASK_DEF" \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[$SUBNET],securityGroups=[$SG],assignPublicIp=DISABLED}"
+```
+
+Monitor the migration output in CloudWatch Logs under `/ecs/medical-ai/migrate`.
 
 ---
 
@@ -66,7 +86,7 @@ Stores patient account credentials and demographics.
 | `phone` | String | nullable | |
 | `created_at` | DateTime | default `now()` | |
 
-**Notes**: `dob_encrypted` contains the Fernet-encrypted ISO date string. The plaintext DOB is never stored. Decryption requires `FERNET_KEY` from `.env`.
+**Notes**: `dob_encrypted` contains the Fernet-encrypted ISO date string. The plaintext DOB is never stored. Decryption requires `FERNET_KEY`.
 
 ---
 
@@ -199,7 +219,7 @@ Created by `escalation_node` in the LangGraph agent when a query is classified a
 | `acknowledged` | Boolean | default `false` | Set to `true` once a clinician has reviewed |
 | `created_at` | DateTime | default `now()` | |
 
-**Notes**: `query_encrypted` stores the query text PHI-encrypted (same Fernet key as `patients.dob_encrypted`) so no clinical query rests in plaintext in the database. This table is created at startup via `Base.metadata.create_all()` — no Alembic migration is required for new installs; existing installs should add a migration.
+**Notes**: `query_encrypted` stores the query text PHI-encrypted (same Fernet key as `patients.dob_encrypted`).
 
 ---
 
@@ -238,7 +258,7 @@ patients ──< agent_escalations >── doctors   (via patient_id / actor_id;
 
 ## Indexes
 
-The Alembic migration creates primary key and unique constraint indexes. For production workloads, consider adding:
+The Alembic migration creates primary key and unique constraint indexes. For production workloads, add:
 
 ```sql
 -- Fast intake lookup (latest per patient)
@@ -273,3 +293,46 @@ CREATE EXTENSION IF NOT EXISTS "pgcrypto";    -- gen_random_bytes() (available i
 ```
 
 The Alembic migration also calls these with `CREATE EXTENSION IF NOT EXISTS` as a safety guard.
+
+In the AWS deployment (RDS), both extensions are pre-installed on PostgreSQL 16 and activated by the first `alembic upgrade head` run. No additional setup is needed in `db/init.sql` — RDS does not execute Docker `ENTRYPOINT` scripts.
+
+---
+
+## AWS RDS Configuration
+
+The RDS instance created by Terraform (`terraform/rds.tf`) is configured as follows:
+
+| Setting | Value |
+|---|---|
+| Engine | PostgreSQL 16.3 |
+| Instance class | `db.t3.medium` (configurable via `db_instance_class` variable) |
+| Storage | 50 GB gp3, auto-scales to 100 GB |
+| Multi-AZ | Yes (automatic failover) |
+| Encryption | At rest (AWS KMS) |
+| Backups | 7-day retention, daily backup window 03:00–04:00 UTC |
+| Deletion protection | Enabled (`terraform destroy` will fail unless manually disabled) |
+| Final snapshot | Created on deletion (`<project>-postgres-final`) |
+| Performance Insights | Enabled |
+
+### Connecting to RDS from a local machine
+
+RDS is in a private subnet with no public access. To run ad-hoc queries or migrations from a local machine:
+
+```bash
+# Option 1 — AWS SSM port forwarding through the Ollama EC2 (which is in the same VPC)
+aws ssm start-session \
+  --target $(terraform output -raw ollama_instance_id) \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters "host=$(terraform output -raw rds_endpoint),portNumber=5432,localPortNumber=5432"
+
+# Then connect locally
+psql postgresql://medical_user:<password>@localhost:5432/medical_ai
+
+# Option 2 — run psql inside an ECS task (no EC2 required)
+aws ecs run-task \
+  --cluster $(terraform output -raw ecs_cluster_name) \
+  --task-definition $(terraform output -raw migrate_task_definition_arn) \
+  --launch-type FARGATE \
+  --overrides '{"containerOverrides":[{"name":"migrate","command":["psql","$DATABASE_URL","-c","\\dt"]}]}' \
+  --network-configuration "awsvpcConfiguration={subnets=[...],securityGroups=[...],assignPublicIp=DISABLED}"
+```

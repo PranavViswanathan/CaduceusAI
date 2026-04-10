@@ -26,7 +26,7 @@ Protected routes use a FastAPI dependency (`get_current_patient`) that:
 
 ### Inter-Service Authentication
 
-Service-to-service endpoints (e.g., `POST /v1/careplan/generate`, `POST /v1/doctor/retrain/trigger`) do not accept JWTs or cookies. They require an `X-Internal-Key` header matching `INTERNAL_API_KEY` from `.env`. Return HTTP 403 if the key is absent or wrong.
+Service-to-service endpoints (e.g., `POST /v1/careplan/generate`, `POST /v1/doctor/retrain/trigger`) do not accept JWTs or cookies. They require an `X-Internal-Key` header matching `INTERNAL_API_KEY`. Return HTTP 403 if the key is absent or wrong.
 
 ---
 
@@ -34,12 +34,12 @@ Service-to-service endpoints (e.g., `POST /v1/careplan/generate`, `POST /v1/doct
 
 Session JWTs are stored in **httpOnly cookies**, never in JavaScript-accessible storage. Cookie attributes:
 
-| Attribute | Value | Reason |
-|---|---|---|
-| `HttpOnly` | true | JavaScript cannot read the token (XSS protection) |
-| `SameSite` | None | Required to allow cross-port sends on localhost |
-| `Secure` | true | Chrome requires Secure when SameSite=None; localhost is treated as a secure context |
-| `Domain` | localhost | No port, so the cookie is sent to all three API services (`:8001`, `:8002`, `:8003`) |
+| Attribute | Local value | Production value | Reason |
+|---|---|---|---|
+| `HttpOnly` | true | true | JavaScript cannot read the token (XSS protection) |
+| `SameSite` | None | Strict | `None` required on localhost for cross-port sends; tighten to `Strict` once all services share one domain |
+| `Secure` | true | true | Chrome requires `Secure` when `SameSite=None`; localhost is a secure context |
+| `Domain` | localhost | your domain (e.g. `api.example.com`) | Update for production so the cookie scope matches the ALB domain |
 
 ---
 
@@ -99,7 +99,7 @@ python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().
 Fernet does not support zero-downtime key rotation out of the box. To rotate:
 1. Generate a new key
 2. Write a migration script that decrypts all `dob_encrypted` values with the old key and re-encrypts with the new key
-3. Update `FERNET_KEY` in `.env` and restart all services
+3. Update `FERNET_KEY` in `.env` (or Secrets Manager in AWS) and restart all services
 
 ---
 
@@ -150,7 +150,9 @@ allow_headers=["*"]
 allow_credentials=True
 ```
 
-`allow_credentials=True` is required for browsers to send the httpOnly session cookies on cross-origin requests. In a production deployment, replace `localhost` origins with the actual domain names.
+`allow_credentials=True` is required for browsers to send the httpOnly session cookies on cross-origin requests.
+
+**In production**: replace `localhost` origins with the actual domain names (e.g., `https://example.com` and `https://doctor.example.com`).
 
 ---
 
@@ -200,18 +202,85 @@ Audit log writes are wrapped in a try/except — a logging failure must not bloc
 
 ---
 
-## Security Checklist for Production Deployment
+## AWS Security Controls
 
-- [ ] Replace all placeholder values in `.env` (JWT_SECRET, FERNET_KEY, INTERNAL_API_KEY, DB password)
+The Terraform deployment adds several layers of security beyond what is possible locally:
+
+### Network Isolation
+
+- All application services (ECS tasks), RDS, Redis, and the Ollama EC2 instance run in **private subnets** with no public IP addresses
+- The only public-facing entry point is the ALB in the public subnets
+- Security groups enforce least-privilege:
+  - ALB SG: inbound 80/443 from `0.0.0.0/0` only
+  - ECS tasks SG: inbound from ALB SG + self (inter-service) only
+  - RDS SG: inbound 5432 from ECS tasks SG only
+  - Redis SG: inbound 6379 from ECS tasks SG only
+  - Ollama SG: inbound 11434 from ECS tasks SG only; SSH only if key pair is configured
+
+### Encryption at Rest
+
+- RDS storage: encrypted at rest (AWS KMS managed key)
+- ElastiCache: encrypted at rest
+- ECR images: AES-256 at rest
+- EBS volumes on Ollama EC2: encrypted at rest
+
+### Encryption in Transit
+
+- ALB to browser: HTTPS (when `acm_certificate_arn` is provided)
+- ECS tasks → RDS: enable `sslmode=require` in `DATABASE_URL` for production
+- ECS tasks → Redis: set `transit_encryption_enabled = true` in `elasticache.tf` and update `REDIS_URL` to `rediss://`
+
+### Secrets Management
+
+- All sensitive values (`JWT_SECRET`, `FERNET_KEY`, `INTERNAL_API_KEY`, DB password) are stored in **AWS Secrets Manager** (`medical-ai/<env>/app-secrets`)
+- ECS task execution role has a scoped policy to read only that specific secret ARN
+- Secrets are injected into task containers at launch — they are never baked into Docker images or stored in ECR
+
+### Ollama Instance Security
+
+- No public IP; reachable only from within the ECS tasks security group
+- AWS Systems Manager (SSM) Session Manager is enabled for admin access — no SSH key required by default
+- Ollama port (11434) is not exposed through the ALB
+
+---
+
+## Production Hardening Checklist
+
+### Application
+
+- [ ] Replace all placeholder values in `.env` / Secrets Manager (`JWT_SECRET`, `FERNET_KEY`, `INTERNAL_API_KEY`, DB password)
 - [ ] Set `FERNET_KEY` to a freshly generated key (never use the example key)
 - [ ] Lock CORS `allow_origins` to actual production domains
-- [ ] Enable HTTPS (terminate TLS at a reverse proxy, e.g. nginx + Let's Encrypt)
-- [x] JWT stored in `httpOnly` cookies (implemented)
-- [x] Rate limiting on auth endpoints — 5 requests/minute per IP (implemented)
 - [ ] Rotate `JWT_SECRET` and `INTERNAL_API_KEY` regularly
-- [ ] Restrict `INTERNAL_API_KEY` endpoint access to internal network only (firewall / VPC rules)
-- [ ] Enable PostgreSQL SSL (`sslmode=require` in `DATABASE_URL`)
-- [ ] Audit `audit_log` table regularly; set up alerts on repeated failures
-- [ ] Do not expose Ollama port (11434) outside the Docker network
-- [ ] Set `Secure` cookie attribute to `true` and ensure HTTPS in production (already set; works on localhost via Chrome's secure-context exception)
-- [ ] Tighten `SameSite` cookie policy to `Strict` once all services share a single domain (currently `None` to allow cross-port sends on localhost)
+- [x] JWT stored in `httpOnly` cookies — implemented
+- [x] Rate limiting on auth endpoints (5 requests/minute per IP) — implemented
+- [x] bcrypt password hashing — implemented
+- [x] PHI fields (DOB, escalated queries) AES-256 encrypted at rest — implemented
+- [x] Audit log on all write operations — implemented
+- [ ] Consider adding a refresh token mechanism for better UX without sacrificing security
+- [ ] Tighten `SameSite` cookie policy to `Strict` once all services share a single domain
+
+### Infrastructure (AWS / Terraform)
+
+- [x] All services in private subnets — implemented in `vpc.tf`
+- [x] Security groups enforce least-privilege per tier — implemented in `security_groups.tf`
+- [x] Secrets in AWS Secrets Manager — implemented in `secrets.tf`
+- [x] RDS encrypted at rest — implemented in `rds.tf`
+- [x] ElastiCache encrypted at rest — implemented in `elasticache.tf`
+- [x] ECR scan-on-push enabled — implemented in `ecr.tf`
+- [x] CloudWatch logs with 30-day retention — implemented in `iam.tf`
+- [x] RDS Multi-AZ for HA — implemented in `rds.tf`
+- [x] RDS deletion protection enabled — implemented in `rds.tf`
+- [x] ALB access logs to S3 — implemented in `alb.tf`
+- [ ] Set `acm_certificate_arn` and enable HTTPS on the ALB
+- [ ] Enable `transit_encryption_enabled = true` on ElastiCache and update `REDIS_URL` to `rediss://`
+- [ ] Add `sslmode=require` to `DATABASE_URL`
+- [ ] Restrict Ollama SSH ingress to a specific CIDR (currently `0.0.0.0/0` when key pair is set)
+- [ ] Enable AWS WAF on the ALB for OWASP top-10 protections
+- [ ] Enable VPC Flow Logs for network auditing
+- [ ] Set up CloudWatch alarms on 5xx error rates and target group unhealthy host counts
+- [ ] Enable RDS Enhanced Monitoring and Performance Insights (Performance Insights is on by default in `rds.tf`)
+- [ ] Enable AWS Config rules for compliance drift detection
+- [ ] Enable AWS GuardDuty for threat detection
+- [ ] Store Terraform state in an S3 backend with DynamoDB locking (commented stub in `main.tf`)
+- [ ] Tag all resources with a `DataClassification` tag if handling real PHI (HIPAA BAA with AWS may be required)

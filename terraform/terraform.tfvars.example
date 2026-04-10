@@ -1,0 +1,32 @@
+# Copy to terraform.tfvars and fill in values. Never commit terraform.tfvars.
+
+aws_region  = "us-east-1"
+environment = "prod"
+
+# ─── Secrets (generate these before applying) ─────────────────────────────────
+# python -c "import secrets; print(secrets.token_hex(32))"
+jwt_secret = "CHANGE_ME_min_32_chars_random_string"
+
+# python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+fernet_key = "CHANGE_ME_base64_fernet_key="
+
+# python -c "import secrets; print(secrets.token_hex(32))"
+internal_api_key = "CHANGE_ME_internal_service_secret"
+
+# ─── Database ──────────────────────────────────────────────────────────────────
+db_password = "CHANGE_ME_strong_db_password"
+
+# ─── Domain (optional — leave empty to use raw ALB DNS) ──────────────────────
+# domain_name         = "myapp.example.com"
+# acm_certificate_arn = "arn:aws:acm:us-east-1:123456789012:certificate/..."
+
+# ─── Ollama GPU instance ───────────────────────────────────────────────────────
+# ollama_key_pair_name = "my-ec2-keypair"   # optional, for SSH access
+# ollama_instance_type = "g4dn.2xlarge"     # upgrade for more VRAM
+
+# ─── After first `terraform apply`, build and push images to ECR then set: ───
+# patient_api_image    = "123456789012.dkr.ecr.us-east-1.amazonaws.com/medical-ai/patient-api:v1.0"
+# doctor_api_image     = "123456789012.dkr.ecr.us-east-1.amazonaws.com/medical-ai/doctor-api:v1.0"
+# postcare_api_image   = "123456789012.dkr.ecr.us-east-1.amazonaws.com/medical-ai/postcare-api:v1.0"
+# patient_portal_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/medical-ai/patient-portal:v1.0"
+# doctor_portal_image  = "123456789012.dkr.ecr.us-east-1.amazonaws.com/medical-ai/doctor-portal:v1.0"

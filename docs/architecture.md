@@ -2,7 +2,7 @@
 
 ## Overview
 
-MedAI Platform is a three-tier, local-first medical AI system. Every tier owns a dedicated FastAPI backend and (where needed) a Next.js frontend. All tiers share a single PostgreSQL database, a Redis instance, and an Ollama LLM server.
+CaduceusAI is a three-tier, local-first medical AI system. Every tier owns a dedicated FastAPI backend and (where needed) a Next.js frontend. All tiers share a single PostgreSQL database, a Redis instance, and an Ollama LLM server. The platform ships as a Docker Compose stack for local development and as a fully managed AWS deployment via Terraform.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -115,7 +115,7 @@ graph TD
 
 ```
 medical-ai-platform/
-├── docker-compose.yml              # Full stack orchestration
+├── docker-compose.yml              # Full stack orchestration (local)
 ├── .env.example                    # Configuration template
 ├── alembic.ini                     # Alembic configuration
 ├── alembic/
@@ -123,82 +123,32 @@ medical-ai-platform/
 │   └── versions/
 │       └── 001_initial_schema.py   # Creates all 8 tables + extensions
 ├── db/
-│   └── init.sql                    # PostgreSQL extension bootstrap (uuid-ossp, pgcrypto)
+│   └── init.sql                    # PostgreSQL extension bootstrap
 ├── services/
 │   ├── patient_api/                # Tier 1 backend  (port 8001)
-│   │   ├── main.py                 # Routes: /v1/auth, /v1/patients, /health
-│   │   ├── models.py               # ORM: Patient, PatientIntake, AuditLog
-│   │   ├── schemas.py              # Pydantic: PatientRegister, IntakeCreate, LoginResponse
-│   │   ├── auth.py                 # Cookie-first JWT auth + get_current_patient dependency
-│   │   ├── encryption.py           # Fernet AES-256 for PHI fields
-│   │   ├── database.py             # SQLAlchemy engine + session factory
-│   │   ├── settings.py             # Settings loaded from .env
-│   │   ├── logging_utils.py        # Structured audit log writer
-│   │   ├── requirements.txt
-│   │   ├── requirements-test.txt
-│   │   ├── Dockerfile
-│   │   └── tests/
-│   │       ├── conftest.py         # Fixtures: mock_db, authed_client, sample_patient
-│   │       ├── test_auth.py        # Registration, login, logout, validation
-│   │       └── test_patients.py    # Intake, profile retrieval, auth guards
 │   ├── doctor_api/                 # Tier 2 backend  (port 8002)
-│   │   ├── main.py                 # Routes: /v1/auth, /v1/doctor, /v1/escalations, /v1/agent, /health
-│   │   ├── models.py               # ORM: Doctor, RiskAssessment, Feedback, Escalation
-│   │   ├── schemas.py              # Pydantic: DoctorRegister, FeedbackCreate, LoginResponse
-│   │   ├── llm.py                  # Ollama + rule-based risk assessment
-│   │   ├── auth.py                 # Cookie-first JWT auth + doctor-role guard
-│   │   ├── encryption.py           # Field decryption (reads encrypted DOB)
-│   │   ├── langgraph.json          # LangGraph Studio config pointing to agent/graph.py:graph
-│   │   ├── requirements.txt
-│   │   ├── requirements-test.txt
-│   │   ├── Dockerfile
-│   │   ├── agent/                  # LangGraph orchestration layer
-│   │   │   ├── __init__.py
-│   │   │   ├── state.py            # AgentState TypedDict (14 typed fields)
-│   │   │   ├── models.py           # ORM: AgentEscalation (agent_escalations table)
-│   │   │   ├── knowledge_base.py   # In-memory medical KB + term-frequency retrieval
-│   │   │   ├── nodes.py            # triage / rag / reasoning / escalation / retraining nodes
-│   │   │   ├── graph.py            # StateGraph wiring + compiled graph export
-│   │   │   └── router.py           # FastAPI router: POST /v1/agent/query, GET /v1/agent/graph
-│   │   └── tests/
-│   │       ├── conftest.py
-│   │       ├── test_auth.py
-│   │       └── test_doctor.py      # Risk assessment, feedback, cache invalidation
+│   │   └── agent/                  # LangGraph orchestration layer
 │   └── postcare_api/               # Tier 3 backend  (port 8003)
-│       ├── main.py                 # Routes: /v1/careplan, /v1/followup, /v1/escalations, /health
-│       ├── models.py               # ORM: CarePlan, FollowupCheckin, Escalation
-│       ├── schemas.py              # Pydantic: CarePlanCreate, CheckinCreate, EscalationResponse
-│       ├── llm.py                  # Care plan generation + urgency assessment
-│       ├── auth.py                 # Cookie-first JWT auth; get_current_user + require_doctor
-│       ├── requirements.txt
-│       ├── requirements-test.txt
-│       ├── Dockerfile
-│       └── tests/
-│           ├── conftest.py         # JWT Bearer header fixtures for TestClient
-│           └── test_postcare.py    # Care plans, checkins, escalation acknowledgment
 ├── frontend/
 │   ├── patient_portal/             # Tier 1 UI  (port 3000)
-│   │   └── src/app/
-│   │       ├── register/page.tsx
-│   │       ├── login/page.tsx
-│   │       ├── intake/page.tsx     # 5-step intake wizard
-│   │       ├── dashboard/page.tsx
-│   │       └── lib/
-│   │           ├── api.ts          # API client (credentials: 'include', /v1/ URLs)
-│   │           └── auth.ts         # patient_id in localStorage; async logout()
 │   └── doctor_portal/              # Tier 2 UI  (port 3001)
-│       └── src/app/
-│           ├── login/page.tsx
-│           ├── patients/page.tsx   # Patient list + escalation alerts
-│           ├── patients/[id]/page.tsx
-│           └── lib/
-│               ├── api.ts
-│               └── auth.ts
+├── terraform/                      # AWS infrastructure (Terraform)
+│   ├── main.tf                     # Provider + backend config
+│   ├── variables.tf
+│   ├── outputs.tf
+│   ├── vpc.tf                      # VPC, subnets, IGW, NAT gateways
+│   ├── security_groups.tf          # Per-tier security groups
+│   ├── ecr.tf                      # ECR repositories + lifecycle policies
+│   ├── iam.tf                      # ECS roles, CloudWatch log groups
+│   ├── secrets.tf                  # AWS Secrets Manager
+│   ├── rds.tf                      # PostgreSQL 16 Multi-AZ
+│   ├── elasticache.tf              # Redis 7 replication group
+│   ├── alb.tf                      # ALB, listener rules, target groups
+│   ├── ecs.tf                      # ECS cluster, task definitions, services
+│   └── ollama.tf                   # EC2 g4dn.xlarge for GPU inference
 ├── scripts/
-│   └── retrain_loop.py             # Feedback drain + batch processing
-└── data/                           # Runtime output (created on first run)
-    ├── retrain_buffer.jsonl
-    └── retrain_log.jsonl
+│   └── retrain_loop.py
+└── data/
 ```
 
 ---
@@ -259,7 +209,7 @@ doctor-portal
       ├── Check Redis cache (key: risk:{patient_id}, TTL 5m)
       │   ├── HIT  → return cached assessment
       │   └── MISS → call llm.get_risk_assessment()
-      │               ├── Try Ollama (llama3 → mistral, 10s timeout)
+      │               ├── Try Ollama (llama3 → mistral, 120s timeout)
       │               └── FALLBACK: rule-based drug interaction check
       ├── Write RiskAssessment row
       ├── Set Redis cache
@@ -340,7 +290,6 @@ doctor-portal (or API client)
 ```
 doctor-portal
   → POST /v1/doctor/patients/{id}/feedback  (doctor-api:8002)
-      ├── Write Feedback row
       └── If action == override|flag:
           └── RPUSH retrain_queue  (Redis)
 
@@ -358,7 +307,7 @@ python3 scripts/retrain_loop.py
 
 ---
 
-## Docker Compose Startup Order
+## Docker Compose Startup Order (Local)
 
 ```
 postgres  ──(healthy)──┐
@@ -373,7 +322,127 @@ patient-api  ──(started)──→  patient-portal
 doctor-api   ──(started)──→  doctor-portal
 ```
 
-The `migrate` service runs `alembic upgrade head` once against PostgreSQL, creating all tables. API services start only after `migrate` exits successfully. The `ollama-init` service pulls required model weights on first boot; subsequent restarts skip the pull because weights are cached in the `ollama_data` Docker volume.
+---
+
+## AWS Deployment Architecture
+
+The `terraform/` directory provisions a production-grade AWS environment that mirrors the Docker Compose topology.
+
+```
+Internet
+    │
+    ▼
+┌──────────────────────────────────────┐
+│  Application Load Balancer (public)  │
+│  HTTP :80 → redirect to HTTPS        │
+│  HTTPS :443 (when ACM cert provided) │
+│                                      │
+│  Listener rules (path-based):        │
+│    /api/patient/*  → patient-api TG  │
+│    /api/doctor/*   → doctor-api TG   │
+│    /api/postcare/* → postcare-api TG │
+│    doctor.<domain> → doctor-portal TG│
+│    default         → patient-portal TG│
+└──────────────────┬───────────────────┘
+                   │  (private subnets)
+        ┌──────────┼──────────────────────────────┐
+        │          │                              │
+        ▼          ▼                              ▼
+  ECS Fargate   ECS Fargate                ECS Fargate
+  patient-api   doctor-api / postcare-api  patient-portal
+  (port 8001)   (ports 8002, 8003)         doctor-portal
+                                           (ports 3000, 3001)
+        │
+        ├──→  RDS PostgreSQL 16 (Multi-AZ, private subnet)
+        ├──→  ElastiCache Redis 7 (primary + replica, private subnet)
+        └──→  EC2 g4dn.xlarge — Ollama (private subnet, GPU inference)
+```
+
+### AWS Resource Map
+
+| Docker Compose service | AWS equivalent |
+|---|---|
+| `postgres` | RDS PostgreSQL 16 (Multi-AZ, `db.t3.medium`, encrypted at rest) |
+| `redis` | ElastiCache Redis 7 (replication group, `cache.t3.micro`, encrypted at rest) |
+| `ollama` | EC2 `g4dn.xlarge` (NVIDIA T4 GPU, 100 GB EBS, user-data installs Ollama + pulls models) |
+| All 5 app services | ECS Fargate tasks in private subnets (2 desired per service) |
+| Docker image registry | ECR (one repo per service, scan-on-push, lifecycle: keep last 10) |
+| `.env` secrets | AWS Secrets Manager (`medical-ai/<env>/app-secrets`) |
+| Container logs | CloudWatch Logs (`/ecs/medical-ai/<service>`, 30-day retention) |
+
+### Terraform Files
+
+| File | Purpose |
+|---|---|
+| `main.tf` | AWS provider, Terraform version constraints, optional S3 backend |
+| `variables.tf` | All input variables (region, secrets, instance types, image URIs, domain) |
+| `outputs.tf` | ALB DNS, ECR URLs, cluster name, subnet IDs, RDS/Redis endpoints |
+| `vpc.tf` | VPC (10.0.0.0/16), 2 public + 2 private subnets, IGW, NAT Gateways, route tables |
+| `security_groups.tf` | ALB SG (0.0.0.0/0:80,443), ECS SG (from ALB + self), RDS SG (from ECS), Redis SG (from ECS), Ollama SG (from ECS) |
+| `ecr.tf` | Five ECR repositories + lifecycle policies (keep last 10 images) |
+| `iam.tf` | ECS execution role (pull images, Secrets Manager, CloudWatch), ECS task role (CloudWatch metrics), CloudWatch log groups |
+| `secrets.tf` | Secrets Manager secret containing JWT, Fernet, internal API key, DB password |
+| `rds.tf` | PostgreSQL 16 RDS instance, subnet group, parameter group |
+| `elasticache.tf` | Redis 7 replication group, subnet group |
+| `alb.tf` | ALB, S3 access-log bucket, target groups (one per service), HTTP + optional HTTPS listeners, path/host-based routing rules |
+| `ecs.tf` | ECS cluster (Container Insights on), task definitions per service, ECS services with circuit breakers, one-shot migration task definition |
+| `ollama.tf` | EC2 with AL2023 AMI, user-data that installs CUDA + Ollama + pulls models, IAM instance profile (SSM + CloudWatch) |
+
+### Deployment Workflow
+
+```bash
+cd terraform
+
+# Step 1 — fill in terraform.tfvars (copy from .example)
+cp terraform.tfvars.example terraform.tfvars
+
+# Step 2 — provision infrastructure (VPC, RDS, Redis, Ollama EC2, ALB, ECR)
+terraform init
+terraform apply
+
+# Step 3 — push Docker images to ECR
+aws ecr get-login-password --region us-east-1 | \
+  docker login --username AWS --password-stdin \
+  $(terraform output -json ecr_repository_urls | jq -r '.["patient-api"]' | cut -d/ -f1)
+
+# Build and push each service (example for patient-api)
+docker build -t patient-api ./services/patient_api
+docker tag patient-api $(terraform output -json ecr_repository_urls | jq -r '.["patient-api"]'):latest
+docker push $(terraform output -json ecr_repository_urls | jq -r '.["patient-api"]'):latest
+
+# Step 4 — run DB migrations (one-time, or after schema changes)
+aws ecs run-task \
+  --cluster $(terraform output -raw ecs_cluster_name) \
+  --task-definition $(terraform output -raw migrate_task_definition_arn) \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={
+    subnets=[$(terraform output -json private_subnet_ids | jq -r '.[0]')],
+    securityGroups=[$(terraform output -raw ecs_tasks_security_group_id)],
+    assignPublicIp=DISABLED}"
+
+# Step 5 — update image URIs in terraform.tfvars and re-apply to force ECS redeployment
+terraform apply
+```
+
+### Ollama EC2 Notes
+
+- Instance type: `g4dn.xlarge` (4 vCPU, 16 GB RAM, NVIDIA T4 GPU)
+- Model weights: stored on the root EBS volume (100 GB, `delete_on_termination = false`, `prevent_destroy = true`)
+- Bootstrap: user-data installs CUDA drivers, Ollama as a systemd service, then pulls `llama3` and `mistral` (~9 GB total) in the background — expect ~10 minutes on first boot
+- SSH access: optional; set `ollama_key_pair_name` in `terraform.tfvars`. Alternatively, use AWS Systems Manager Session Manager (SSM is enabled by default via IAM instance profile)
+- The Ollama port (11434) is only reachable from within the ECS tasks security group — it has no public IP and is not exposed to the internet
+
+### NEXT_PUBLIC_* Build-Time Variables
+
+Next.js bakes `NEXT_PUBLIC_*` environment variables into the JavaScript bundle at **build time**, not at runtime. In AWS, the portal images must be built with the real ALB URL (or domain) before being pushed to ECR. Update the Docker build arguments accordingly:
+
+```bash
+docker build \
+  --build-arg NEXT_PUBLIC_PATIENT_API_URL=https://api.example.com/api/patient \
+  --build-arg NEXT_PUBLIC_DOCTOR_API_URL=https://api.example.com/api/doctor \
+  --build-arg NEXT_PUBLIC_POSTCARE_API_URL=https://api.example.com/api/postcare \
+  -t patient-portal ./frontend/patient_portal
+```
 
 ---
 
@@ -409,17 +478,21 @@ or, when a dependency is degraded:
 }
 ```
 
+ALB target groups are configured to call `/health` every 30 seconds. A target is marked unhealthy after 3 consecutive failures and removed from rotation. ECS deployment circuit breakers automatically roll back a release if too many tasks fail to reach a healthy state.
+
 ---
 
 ## Inter-Service Authentication
 
-Service-to-service calls (e.g., `doctor-api` triggering a retrain drain, `postcare-api` generating a care plan) use the `X-Internal-Key` header matched against `INTERNAL_API_KEY` in `.env`. Patient and doctor session cookies are **not** accepted on internal routes.
+Service-to-service calls (e.g., `doctor-api` triggering a retrain drain, `postcare-api` generating a care plan) use the `X-Internal-Key` header matched against `INTERNAL_API_KEY`. Patient and doctor session cookies are **not** accepted on internal routes.
+
+In AWS, internal endpoints should additionally be isolated at the security group level — only traffic from within the ECS tasks security group can reach any service port.
 
 ---
 
 ## Cookie-Based Authentication
 
-Login endpoints set an httpOnly cookie scoped to `domain=localhost` (no port). Because RFC 6265 matches cookies by host only (ignoring port), a cookie set by `:8001` is sent to `:8002` and `:8003`. Chrome treats `localhost` as a secure context, so `SameSite=None; Secure` works over plain HTTP on localhost. The JWTs are never exposed to JavaScript.
+Login endpoints set an httpOnly cookie scoped to `domain=localhost` in development (no port). In production, update the `Domain` attribute to match your actual domain.
 
 | Cookie name | Set by | Read by |
 |---|---|---|
@@ -427,6 +500,8 @@ Login endpoints set an httpOnly cookie scoped to `domain=localhost` (no port). B
 | `doctor_access_token` | doctor-api | doctor-api, postcare-api |
 
 Each auth dependency reads the cookie first; if absent, it falls back to an `Authorization: Bearer` header for Swagger UI and programmatic testing.
+
+In production (behind the ALB), all three API services share the same domain and the cookie `Domain` attribute should be set to that domain (e.g., `api.example.com`).
 
 ---
 
@@ -446,13 +521,15 @@ Each auth dependency reads the cookie first; if absent, it falls back to an `Aut
 | `NEXT_PUBLIC_DOCTOR_API_URL` | doctor-portal | Browser-visible doctor API base URL |
 | `NEXT_PUBLIC_POSTCARE_API_URL` | both portals | Browser-visible postcare API base URL |
 
+In AWS, all secret values (`JWT_SECRET`, `FERNET_KEY`, `INTERNAL_API_KEY`, `DATABASE_URL` password) are stored in AWS Secrets Manager and injected into ECS tasks at runtime via the execution role.
+
 ---
 
 ## Failure Modes
 
 | Failure | Behaviour |
 |---|---|
-| Ollama timeout / unavailable | Rule-based fallback (10 s timeout); response has `source: "rule_based"`, confidence `"low"` |
+| Ollama timeout / unavailable | Rule-based fallback (120 s timeout); response has `source: "rule_based"`, confidence `"low"` |
 | PostgreSQL down | HTTP 503, no stack traces in response body |
 | Redis down | Cache miss treated as no-op; queue pushes fail silently with a log warning |
 | PHI decryption failure | Field returns `None`; request continues |
@@ -460,3 +537,7 @@ Each auth dependency reads the cookie first; if absent, it falls back to an `Aut
 | Session cookie missing / expired | HTTP 401 `Not authenticated` |
 | Missing `X-Internal-Key` | HTTP 403 `Forbidden` |
 | Rate limit exceeded | HTTP 429 `Too Many Requests` |
+| ECS task crash | ECS restarts the task automatically; ALB removes it from rotation until healthy |
+| RDS failover (AWS Multi-AZ) | Automatic failover in ~60–120 s; `DATABASE_URL` remains unchanged (CNAME-based) |
+| ElastiCache replica failure (AWS) | Automatic failover to replica promoted to primary |
+| Ollama EC2 stop/restart | Models are retained on the EBS volume; Ollama starts automatically via systemd |

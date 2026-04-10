@@ -1,6 +1,6 @@
 # CaduceusAI Platform — Three-Tier Medical AI System
 
-**CaduceusAI** is a local-first, three-tier medical AI platform that covers the full patient journey — from intake to clinical decision support to post-care follow-up  with all LLM inference running on-device via Ollama. No patient data ever leaves the host.
+**CaduceusAI** is a local-first, three-tier medical AI platform that covers the full patient journey — from intake to clinical decision support to post-care follow-up — with all LLM inference running on-device via Ollama. No patient data ever leaves the host.
 
 The system is split across three independently deployable tiers: a patient-facing portal for registration, intake, and care plan review; a clinical decision support layer where doctors get AI-generated risk assessments with confidence scoring and can submit feedback to correct the model; and a post-care service that generates structured care plans from visit notes and triages follow-up symptom reports into `routine`, `monitor`, or `escalate` urgency levels.
 
@@ -14,12 +14,12 @@ The stack is fully containerized: FastAPI backends, Next.js 14 frontends, Postgr
 
 | Doc | Description |
 |---|---|
-| [Architecture](docs/architecture.md) | Full system design — tiers, services, LangGraph agent, request flows, Docker orchestration, failure modes |
-| [AI Model & LLM](docs/model.md) | Ollama integration, LangGraph agent nodes, prompt design, rule-based fallbacks, retraining pipeline |
-| [Database Schema](docs/database.md) | All tables (incl. `agent_escalations`), columns, constraints, relationships, and recommended indexes |
-| [API Reference](docs/api.md) | Every endpoint across all three services with request/response examples |
-| [Frontend Portals](docs/frontend.md) | Patient and doctor portals — pages, data flows, API clients, auth helpers |
-| [Security Model](docs/security.md) | Auth, PHI encryption (incl. agent query text), CORS, audit logging, and production hardening checklist |
+| [Architecture](docs/architecture.md) | Full system design — tiers, services, LangGraph agent, request flows, Docker orchestration, AWS deployment, failure modes |
+| [AI Model & LLM](docs/model.md) | Ollama integration, LangGraph agent nodes, prompt design, rule-based fallbacks, retraining pipeline, AWS GPU inference |
+| [Database Schema](docs/database.md) | All tables (incl. `agent_escalations`), columns, constraints, relationships, indexes, and AWS RDS migration |
+| [API Reference](docs/api.md) | Every endpoint across all three services with request/response examples and AWS routing |
+| [Frontend Portals](docs/frontend.md) | Patient and doctor portals — pages, data flows, API clients, auth helpers, AWS deployment notes |
+| [Security Model](docs/security.md) | Auth, PHI encryption, CORS, audit logging, AWS security controls, and production hardening checklist |
 
 ---
 
@@ -65,9 +65,11 @@ The stack is fully containerized: FastAPI backends, Next.js 14 frontends, Postgr
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/) (v24+)
 - [Docker Compose](https://docs.docker.com/compose/) (v2.20+)
 
+For AWS deployment: [Terraform](https://developer.hashicorp.com/terraform/install) (v1.6+) and the [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html) (v2).
+
 ---
 
-## Setup & Run
+## Setup & Run (Local)
 
 ### 1. Configure environment
 
@@ -111,8 +113,6 @@ Model weights are stored in a Docker volume (`ollama_data`) and only downloaded 
 
 ### 4. Bootstrap a doctor account
 
-Use the API docs at http://localhost:8002/docs or curl:
-
 ```bash
 # Register a doctor
 curl -X POST http://localhost:8002/v1/auth/register \
@@ -132,6 +132,51 @@ curl -X POST http://localhost:8002/v1/agent/query \
   -H "Authorization: Bearer <doctor_token>" \
   -d '{"query": "What is the first-line treatment for hypertension in a diabetic patient?"}'
 ```
+
+---
+
+## AWS Deployment (Terraform)
+
+Full infrastructure-as-code lives in the `terraform/` directory. It provisions:
+
+- **VPC** with public + private subnets across 2 AZs
+- **ALB** with path-based routing for all services
+- **ECS Fargate** for all 5 application containers
+- **RDS PostgreSQL 16** (Multi-AZ, encrypted)
+- **ElastiCache Redis 7** (primary + replica)
+- **Ollama on EC2** (`g4dn.xlarge` with NVIDIA T4 GPU)
+- **ECR** repositories for all service images
+- **Secrets Manager** for all sensitive values
+- **CloudWatch** log groups per service
+
+### Quick start
+
+```bash
+cd terraform
+
+# 1. Fill in secrets and config
+cp terraform.tfvars.example terraform.tfvars
+# edit terraform.tfvars
+
+# 2. Init and apply
+terraform init
+terraform apply
+
+# 3. Get ECR URLs and push images
+terraform output ecr_repository_urls
+
+# 4. Run DB migrations (one-time)
+aws ecs run-task \
+  --cluster $(terraform output -raw ecs_cluster_name) \
+  --task-definition $(terraform output -raw migrate_task_definition_arn) \
+  --launch-type FARGATE \
+  --network-configuration "awsvpcConfiguration={subnets=[$(terraform output -json private_subnet_ids | jq -r '.[0]')],securityGroups=[$(terraform output -raw ecs_tasks_security_group_id)],assignPublicIp=DISABLED}"
+
+# 5. Access the platform
+terraform output patient_portal_url
+```
+
+See [Architecture](docs/architecture.md) for the full AWS topology.
 
 ---
 
@@ -164,10 +209,7 @@ The `TESTING=true` environment variable skips database `create_all()` on startup
 
 The retrain loop script processes clinician feedback that was flagged for model improvement.
 
-### Run it
-
 ```bash
-# From the repo root
 python3 scripts/retrain_loop.py
 ```
 
@@ -177,23 +219,14 @@ Or from within Docker:
 docker compose exec doctor-api python /app/retrain_loop.py
 ```
 
-### What it does
-
-1. Reads `./data/retrain_buffer.jsonl` (populated when doctors override or flag AI assessments)
-2. Prints a summary of each feedback item: patient_id, action, reason, and assessment used
-3. Appends a timestamped processing record to `./data/retrain_log.jsonl`
-4. Clears the buffer
-
-In a production system, this step would feed into a LoRA fine-tuning pipeline — see the comment block at the top of `scripts/retrain_loop.py` for the full architecture description.
-
-### Trigger the retrain queue drain (API)
-
-The doctor-api also exposes an internal endpoint to drain the Redis queue to the JSONL file:
+Trigger the retrain queue drain via the API:
 
 ```bash
 curl -X POST http://localhost:8002/v1/doctor/retrain/trigger \
   -H "X-Internal-Key: internal-service-api-key-change-in-production"
 ```
+
+See [AI Model & LLM](docs/model.md) for the full retraining pipeline.
 
 ---
 
@@ -201,7 +234,7 @@ curl -X POST http://localhost:8002/v1/doctor/retrain/trigger \
 
 ### `migrate` service exits with `DuplicateTable` error
 
-This happens if tables were created outside of Alembic (e.g. by a previous stack that didn't complete cleanly) but the `alembic_version` table is missing. Fix by stamping the current revision:
+Tables were created outside of Alembic but `alembic_version` is missing. Fix by stamping the current revision:
 
 ```bash
 docker run --rm \
@@ -230,7 +263,7 @@ The `ollama/ollama` image does not include `curl`. The healthcheck uses `ollama 
    ```bash
    docker compose exec ollama ollama pull llama3
    ```
-3. If the model is present but the portal still shows "AI unavailable", flush the Redis cache (a stale rule-based result may be cached):
+3. If the model is present but the portal still shows "AI unavailable", flush the Redis cache:
    ```bash
    docker compose exec redis redis-cli FLUSHALL
    ```
@@ -243,39 +276,14 @@ The `ollama/ollama` image does not include `curl`. The healthcheck uses `ollama 
 - All sensitive fields (DOB, escalated agent query text) are AES-256 encrypted at rest using Fernet
 - Passwords are bcrypt-hashed
 - JWTs use HS256, expire after 30 minutes, and are stored in **httpOnly cookies** (never in localStorage)
-- Auth cookies are set with `SameSite=None; Secure; HttpOnly; Domain=localhost`, allowing them to be shared across the three API ports on localhost
 - Role claims (`role=doctor` vs patient) are validated on every protected route
 - Inter-service calls require `X-Internal-Key` header
 - Rate limiting is active on all auth endpoints (5 requests/minute per IP; 1000/minute in test mode)
 - Audit log records every write operation (actor, action, outcome) without logging PHI values
-- CORS is locked to `localhost:3000` and `localhost:3001`
+- CORS is locked to `localhost:3000` and `localhost:3001` (update to real domains for production)
+- In AWS: secrets live in Secrets Manager, DB is encrypted at rest (RDS), Redis is encrypted at rest (ElastiCache), Ollama is private (no public IP)
 
----
-
-## PHI Encryption
-
-The `FERNET_KEY` in `.env` is used to encrypt sensitive patient fields before storage. **Never commit your `.env` file.** The `.env.example` contains a placeholder key for reference only.
-
----
-
-## Fault Tolerance
-
-- Every Ollama call has a 120-second timeout with automatic fallback to rule-based assessment (CPU inference of llama3 can take 30–90 s)
-- Redis failures are silent (cache miss, no caching)
-- PostgreSQL failures return HTTP 503 with a safe error message (no stack traces)
-- Each service exposes `GET /health` reporting DB + Redis status
-
----
-
-## Development
-
-To run a single service locally (outside Docker):
-
-```bash
-cd services/patient_api
-pip install -r requirements.txt
-DATABASE_URL=postgresql://... JWT_SECRET=... FERNET_KEY=... uvicorn main:app --port 8001 --reload
-```
+See [Security Model](docs/security.md) for the full production hardening checklist.
 
 ---
 
@@ -285,13 +293,13 @@ DATABASE_URL=postgresql://... JWT_SECRET=... FERNET_KEY=... uvicorn main:app --p
 medical-ai-platform/
 ├── docker-compose.yml
 ├── .env.example
-├── alembic.ini                         # Alembic configuration
+├── alembic.ini
 ├── alembic/
-│   ├── env.py                          # Alembic environment (reads DATABASE_URL)
+│   ├── env.py
 │   └── versions/
-│       └── 001_initial_schema.py       # Initial schema migration
+│       └── 001_initial_schema.py
 ├── db/
-│   └── init.sql                        # PostgreSQL extensions bootstrap
+│   └── init.sql
 ├── services/
 │   ├── patient_api/                    # Tier 1 backend (port 8001)
 │   │   ├── main.py
@@ -302,51 +310,57 @@ medical-ai-platform/
 │   │   ├── database.py
 │   │   ├── settings.py
 │   │   ├── requirements.txt
-│   │   ├── requirements-test.txt
 │   │   ├── Dockerfile
 │   │   └── tests/
-│   │       ├── conftest.py
-│   │       ├── test_auth.py
-│   │       └── test_patients.py
 │   ├── doctor_api/                     # Tier 2 backend (port 8002)
 │   │   ├── main.py
-│   │   ├── llm.py                      # Ollama + rule-based fallback
+│   │   ├── llm.py
 │   │   ├── models.py
-│   │   ├── langgraph.json              # LangGraph Studio config
-│   │   ├── agent/                      # LangGraph orchestration layer
-│   │   │   ├── state.py                # AgentState TypedDict
-│   │   │   ├── models.py               # AgentEscalation ORM model
-│   │   │   ├── knowledge_base.py       # In-memory medical KB for RAG
-│   │   │   ├── nodes.py                # 5 agent nodes
-│   │   │   ├── graph.py                # StateGraph + compiled graph export
-│   │   │   └── router.py               # /v1/agent/query + /v1/agent/graph
+│   │   ├── langgraph.json
+│   │   ├── agent/
+│   │   │   ├── state.py
+│   │   │   ├── models.py
+│   │   │   ├── knowledge_base.py
+│   │   │   ├── nodes.py
+│   │   │   ├── graph.py
+│   │   │   └── router.py
 │   │   ├── requirements.txt
-│   │   ├── requirements-test.txt
+│   │   ├── Dockerfile
 │   │   └── tests/
-│   │       ├── conftest.py
-│   │       ├── test_auth.py
-│   │       └── test_doctor.py
 │   └── postcare_api/                   # Tier 3 backend (port 8003)
 │       ├── main.py
-│       ├── llm.py                      # Care plan + urgency assessment
+│       ├── llm.py
 │       ├── requirements.txt
-│       ├── requirements-test.txt
+│       ├── Dockerfile
 │       └── tests/
-│           ├── conftest.py
-│           └── test_postcare.py
 ├── frontend/
 │   ├── patient_portal/                 # Tier 1 UI (port 3000)
 │   │   └── src/app/
 │   │       ├── register/page.tsx
 │   │       ├── login/page.tsx
-│   │       ├── intake/page.tsx         # 5-step intake form
+│   │       ├── intake/page.tsx
 │   │       └── dashboard/page.tsx
 │   └── doctor_portal/                  # Tier 2 UI (port 3001)
 │       └── src/app/
 │           ├── login/page.tsx
 │           ├── patients/page.tsx
-│           └── patients/[id]/page.tsx  # LLM risk panel + feedback
+│           └── patients/[id]/page.tsx
+├── terraform/                          # AWS infrastructure (Terraform)
+│   ├── main.tf                         # Provider + backend config
+│   ├── variables.tf                    # All input variables
+│   ├── outputs.tf                      # ALB DNS, ECR URLs, cluster name, etc.
+│   ├── vpc.tf                          # VPC, subnets, IGW, NAT, route tables
+│   ├── security_groups.tf              # SGs for ALB, ECS, RDS, Redis, Ollama
+│   ├── ecr.tf                          # ECR repos + lifecycle policies
+│   ├── iam.tf                          # ECS execution/task roles, CloudWatch log groups
+│   ├── secrets.tf                      # Secrets Manager secret
+│   ├── rds.tf                          # RDS PostgreSQL 16 (Multi-AZ)
+│   ├── elasticache.tf                  # ElastiCache Redis 7
+│   ├── alb.tf                          # ALB, target groups, listener rules
+│   ├── ecs.tf                          # ECS cluster, task definitions, services
+│   ├── ollama.tf                       # EC2 g4dn.xlarge for Ollama + IAM
+│   └── terraform.tfvars.example        # Variable template (copy → terraform.tfvars)
 ├── scripts/
-│   └── retrain_loop.py                 # Feedback → retraining pipeline intake
-└── data/                               # Runtime data (retrain_buffer.jsonl, logs)
+│   └── retrain_loop.py
+└── data/
 ```

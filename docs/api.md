@@ -1,6 +1,8 @@
 # API Reference
 
-Interactive Swagger docs are available when the stack is running:
+## Swagger / Interactive Docs
+
+When running locally, interactive Swagger docs are available at:
 
 | Service | Docs URL |
 |---|---|
@@ -8,11 +10,29 @@ Interactive Swagger docs are available when the stack is running:
 | Doctor API | http://localhost:8002/docs |
 | PostCare API | http://localhost:8003/docs |
 
-All endpoints are versioned under the `/v1/` prefix. Authentication is cookie-based — the login endpoint sets an httpOnly cookie that the browser sends automatically. Swagger UI's Authorize button (Bearer token fallback) still works for interactive testing.
+All endpoints are versioned under the `/v1/` prefix. Authentication is cookie-based — the login endpoint sets an httpOnly cookie that the browser sends automatically. The Swagger UI Authorize button (Bearer token fallback) still works for interactive testing.
 
 ---
 
-## Patient API (port 8001)
+## AWS Path-Based Routing
+
+In the AWS deployment (see [Architecture](architecture.md)), all services sit behind a single ALB. The default path prefixes used for ALB routing are:
+
+| Service | ALB path prefix | Local port |
+|---|---|---|
+| patient-api | `/api/patient/*` | `:8001` |
+| doctor-api | `/api/doctor/*` | `:8002` |
+| postcare-api | `/api/postcare/*` | `:8003` |
+| patient-portal | default (root) | `:3000` |
+| doctor-portal | `doctor.<domain>` host header | `:3001` |
+
+The ALB strips the prefix before forwarding to the target group, so the application code is unchanged — `/v1/auth/token` remains `/v1/auth/token` regardless of environment.
+
+Swagger docs are not exposed through the ALB in production. Use an SSM session or VPN to reach the service ports directly if needed.
+
+---
+
+## Patient API (port 8001 / `/api/patient`)
 
 ### Authentication
 
@@ -149,7 +169,7 @@ or `503`:
 
 ---
 
-## Doctor API (port 8002)
+## Doctor API (port 8002 / `/api/doctor`)
 
 All endpoints under `/v1/doctor/` require a `doctor_access_token` httpOnly cookie (or `Authorization: Bearer` fallback) where the token carries `role="doctor"`.
 
@@ -373,7 +393,7 @@ Return the LangGraph graph structure as JSON for developer tooling and LangGraph
 
 ---
 
-## PostCare API (port 8003)
+## PostCare API (port 8003 / `/api/postcare`)
 
 ### Care Plans
 

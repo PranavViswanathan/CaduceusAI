@@ -2,7 +2,7 @@
 
 ## Overview
 
-The platform uses **Ollama** for fully local LLM inference. No data ever leaves the host machine. Two models are supported: `llama3` (recommended, ~4.7 GB) and `mistral` (~4.1 GB). Both APIs that call the LLM implement automatic rule-based fallbacks so the system remains functional even when Ollama is unavailable or times out.
+The platform uses **Ollama** for fully local LLM inference. No data ever leaves the host machine (or VPC in the AWS deployment). Two models are supported: `llama3` (recommended, ~4.7 GB) and `mistral` (~4.1 GB). Both APIs that call the LLM implement automatic rule-based fallbacks so the system remains functional even when Ollama is unavailable or times out.
 
 ---
 
@@ -44,7 +44,7 @@ JSON:
 
 1. Try `llama3` first (faster, recommended)
 2. On model-not-found error, retry with `mistral`
-3. Both attempts share a 120-second async timeout (`httpx.AsyncClient`) — CPU inference of llama3 typically takes 30–90 s
+3. Both attempts share a 120-second async timeout (`httpx.AsyncClient`) — CPU inference of llama3 typically takes 30–90 s; GPU inference on `g4dn.xlarge` takes ~2–5 s
 
 ### JSON Extraction
 
@@ -171,9 +171,9 @@ If urgency is `escalate`:
 
 ## Ollama Configuration
 
-Ollama is started as a Docker service and is accessible at `http://ollama:11434` inside the Docker network (configured via `OLLAMA_URL` in `.env`).
+### Local (Docker Compose)
 
-### Automatic Model Setup
+Ollama is started as a Docker service and is accessible at `http://ollama:11434` inside the Docker network (configured via `OLLAMA_URL` in `.env`).
 
 Models are pulled automatically on first boot by the `ollama-init` Docker Compose service:
 
@@ -195,21 +195,62 @@ ollama-init:
 
 Model weights are stored in the `ollama_data` Docker volume. On subsequent `docker compose up` runs the volume already contains the weights, so `ollama-init` exits immediately without re-downloading.
 
-### Healthcheck
-
 The `ollama` service healthcheck uses `ollama list` rather than `curl`, because the `ollama/ollama` image does not include `curl`.
 
-### Manual Pull (if needed)
-
 ```bash
-# Pull into a running stack
+# Manual pull if needed
 docker compose exec ollama ollama pull llama3
 docker compose exec ollama ollama pull mistral
 ```
 
-### Async HTTP Client
+### AWS (EC2 g4dn.xlarge)
 
-All Ollama calls use `httpx.AsyncClient` with a 120-second timeout. The long timeout is necessary because CPU-only inference of llama3 (8 B parameters, Q4_0 quantisation) typically takes 30–90 s depending on host hardware.
+In the AWS deployment, Ollama runs on an EC2 `g4dn.xlarge` instance with an NVIDIA T4 GPU (16 GB VRAM). This is provisioned by `terraform/ollama.tf`.
+
+| Spec | Value |
+|---|---|
+| Instance type | `g4dn.xlarge` (configurable via `ollama_instance_type`) |
+| GPU | NVIDIA T4 (16 GB VRAM) |
+| vCPU | 4 |
+| RAM | 16 GB |
+| Storage | 100 GB gp3 EBS (configurable via `ollama_volume_size`) |
+| OS | Amazon Linux 2023 |
+| Inference speed | ~2–5 s per request (vs 30–90 s on CPU) |
+
+Bootstrap process (user-data script):
+1. Install CUDA toolkit + NVIDIA drivers (dnf)
+2. Install Ollama via official install script
+3. Create `ollama` system user and `/var/lib/ollama/models` directory
+4. Register Ollama as a systemd service (`OLLAMA_HOST=0.0.0.0`)
+5. Pull `llama3` and `mistral` into `/var/lib/ollama/models` (~9 GB total, runs in background after boot)
+
+The EBS root volume has `delete_on_termination = false` and the instance has `prevent_destroy = true` in Terraform to prevent accidental model re-download (~10 minutes, ~9 GB). Use AWS SSM Session Manager to access the instance without SSH:
+
+```bash
+aws ssm start-session --target <ollama-instance-id>
+
+# Check Ollama service status
+systemctl status ollama
+
+# Verify models are loaded
+curl http://localhost:11434/api/tags
+
+# Monitor model pull progress (on first boot)
+tail -f /var/log/ollama-init.log
+```
+
+ECS tasks reach Ollama via its private IP address, which Terraform resolves automatically:
+
+```hcl
+# In ecs.tf
+ollama_url = "http://${aws_instance.ollama.private_ip}:11434"
+```
+
+---
+
+## Async HTTP Client
+
+All Ollama calls use `httpx.AsyncClient` with a 120-second timeout. The long timeout accommodates CPU-only inference on development machines; GPU inference on AWS typically completes in 2–5 seconds.
 
 ```python
 async with httpx.AsyncClient(timeout=120.0) as client:
@@ -240,7 +281,7 @@ When a doctor submits feedback with `action = override` or `action = flag`, `doc
 }
 ```
 
-Feedback with `action = agree` is stored in the database but **not** queued for retraining — agreement is a positive signal that doesn't require model correction.
+Feedback with `action = agree` is stored in the database but **not** queued for retraining.
 
 ### 2. Buffer Drain
 
@@ -279,8 +320,6 @@ The script's docstring describes the full production pipeline the retrain loop i
 | **Evaluation** | F1 on urgency classification, ROUGE on narrative, false-negative rate on high-risk cases |
 | **Canary rollout** | 10 % traffic for 24 hours before full promotion |
 | **Rollback** | Every version links to its training data, eval results, and contributing feedback items |
-
----
 
 ---
 
@@ -344,7 +383,7 @@ Handles **urgent** queries and low-confidence complex queries. Creates an `Agent
 
 #### `retraining_trigger_node`
 
-Runs at the end of every non-escalation path. Checks whether `feedback_score` (passed in from the API request) falls below `RETRAIN_SCORE_THRESHOLD` (default 0.4, overridable via env var). If so, pushes a payload to the Redis `retrain_queue` using the same JSON format as the existing feedback pipeline:
+Runs at the end of every non-escalation path. Checks whether `feedback_score` (passed in from the API request) falls below `RETRAIN_SCORE_THRESHOLD` (default 0.4, overridable via env var). If so, pushes a payload to the Redis `retrain_queue`:
 
 ```json
 {
@@ -373,7 +412,7 @@ The `GET /v1/agent/graph` endpoint returns the same graph structure as JSON for 
 
 ### Dependencies Injected via RunnableConfig
 
-Nodes do not open new database or Redis connections. The FastAPI-managed `db` session and the result of `_get_redis()` are injected via `config["configurable"]` at invocation time:
+Nodes do not open new database or Redis connections. The FastAPI-managed `db` session and Redis client are injected via `config["configurable"]` at invocation time:
 
 ```python
 result = await graph.ainvoke(
@@ -403,3 +442,18 @@ Every call to `GET /v1/doctor/patients/{id}/risk` stores a new `RiskAssessment` 
 | `low` | Rule-based fallback was used, or Ollama output was sparse |
 
 Confidence is displayed in the doctor portal's risk panel to help clinicians calibrate how much weight to place on the AI assessment.
+
+---
+
+## Inference Performance
+
+| Environment | Hardware | Typical latency |
+|---|---|---|
+| Local (Docker) | CPU only (no GPU) | 30–90 s per request |
+| AWS (`g4dn.xlarge`) | NVIDIA T4 GPU | 2–5 s per request |
+| AWS (`g4dn.2xlarge`) | NVIDIA T4 GPU (2×) | 1–3 s per request |
+
+For production workloads with many concurrent doctors, consider:
+- Upgrading to `g4dn.2xlarge` or `g4dn.12xlarge` for more VRAM (set `ollama_instance_type` in `terraform.tfvars`)
+- Running multiple Ollama instances behind an internal load balancer
+- Moving to a managed inference endpoint (AWS Bedrock) if data-residency requirements allow it — this would require changes to `llm.py`

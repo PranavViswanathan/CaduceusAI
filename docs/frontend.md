@@ -214,12 +214,90 @@ API errors are caught in `try/catch` blocks. On 401, both portals call `clearAut
 
 Because cookies are scoped to `domain=localhost` (without a port), the `patient_access_token` set by `patient-api` on `:8001` is automatically sent by the browser to `postcare-api` on `:8003`. This allows the patient portal's check-in calls to work without any additional auth steps.
 
-### Environment Variables
+---
 
-| Variable | Portal | Value |
-|---|---|---|
-| `NEXT_PUBLIC_PATIENT_API_URL` | patient-portal | `http://localhost:8001` |
-| `NEXT_PUBLIC_POSTCARE_API_URL` | both | `http://localhost:8003` |
-| `NEXT_PUBLIC_DOCTOR_API_URL` | doctor-portal | `http://localhost:8002` |
+## Environment Variables
+
+| Variable | Portal | Local value | Notes |
+|---|---|---|---|
+| `NEXT_PUBLIC_PATIENT_API_URL` | patient-portal | `http://localhost:8001` | In AWS: `https://<alb-dns>/api/patient` |
+| `NEXT_PUBLIC_POSTCARE_API_URL` | both | `http://localhost:8003` | In AWS: `https://<alb-dns>/api/postcare` |
+| `NEXT_PUBLIC_DOCTOR_API_URL` | doctor-portal | `http://localhost:8002` | In AWS: `https://<alb-dns>/api/doctor` |
 
 These are injected at build time by Docker Compose and baked into the Next.js bundle. Changing them requires a rebuild (`docker compose up --build`).
+
+---
+
+## AWS Deployment Notes
+
+### Build-Time Variables Are Baked In
+
+`NEXT_PUBLIC_*` variables are embedded in the compiled JavaScript at **build time**, not at container startup. This is a Next.js constraint — the browser receives static JS files, and runtime environment variables are not available.
+
+**Consequence**: portal Docker images built for local development (pointing at `localhost`) will not work in AWS. You must rebuild the images with the production URLs before pushing to ECR.
+
+```bash
+# Get the ALB DNS name after terraform apply
+ALB=$(cd terraform && terraform output -raw alb_dns_name)
+
+# Or, if using a custom domain:
+ALB="https://example.com"
+
+# Build patient portal with AWS URLs
+docker build \
+  --build-arg NEXT_PUBLIC_PATIENT_API_URL=${ALB}/api/patient \
+  --build-arg NEXT_PUBLIC_DOCTOR_API_URL=${ALB}/api/doctor \
+  --build-arg NEXT_PUBLIC_POSTCARE_API_URL=${ALB}/api/postcare \
+  -t patient-portal \
+  ./frontend/patient_portal
+
+# Build doctor portal
+docker build \
+  --build-arg NEXT_PUBLIC_PATIENT_API_URL=${ALB}/api/patient \
+  --build-arg NEXT_PUBLIC_DOCTOR_API_URL=${ALB}/api/doctor \
+  --build-arg NEXT_PUBLIC_POSTCARE_API_URL=${ALB}/api/postcare \
+  -t doctor-portal \
+  ./frontend/doctor_portal
+```
+
+Then tag and push to ECR as shown in the deployment workflow in [Architecture](architecture.md).
+
+### Cookie Domain in Production
+
+In production all APIs sit behind the same ALB domain (`api.example.com` or a subdomain). The cookie `Domain` attribute in each service's auth module must be updated from `localhost` to the production domain so the browser sends it to all API paths.
+
+Update in each API's auth module before building the Docker images:
+
+```python
+# Before (local)
+response.set_cookie(
+    key="patient_access_token",
+    value=token,
+    domain="localhost",
+    ...
+)
+
+# After (production)
+response.set_cookie(
+    key="patient_access_token",
+    value=token,
+    domain="api.example.com",  # or read from an env var
+    ...
+)
+```
+
+### Doctor Portal Routing
+
+In AWS, the doctor portal is routed via an ALB host-header rule: requests to `doctor.<domain>` are forwarded to the doctor-portal target group. This requires `domain_name` to be set in `terraform.tfvars`. Without it, both portals are accessible via the same domain and you would need to use a different path-based or query-string mechanism to differentiate them.
+
+### CORS Origins in Production
+
+Update the CORS `allow_origins` in each API before deploying to AWS:
+
+```python
+# patient-api / doctor-api / postcare-api
+allow_origins=[
+    "https://example.com",        # patient portal
+    "https://doctor.example.com", # doctor portal
+]
+```
