@@ -54,7 +54,9 @@ graph TD
         RQ["retrain_queue\nRedis list"]
         RB2["retrain_buffer.jsonl"]
         RL["retrain_log.jsonl"]
-        RS["retrain_loop.py"]
+        RS["retrain_loop.py\n(retrain-worker)"]
+        MR["model registry\nregistry.json"]
+        OLF["medical-risk-ft\nOllama model"]
     end
 
     PA -->|write intake + audit| PG
@@ -66,7 +68,10 @@ graph TD
     DA -->|RPUSH on override/flag| RQ
     RQ -->|LPOP drain| RB2
     RB2 --> RS
+    RS -->|PEFT LoRA train + GGUF| OLF
     RS --> RL
+    RS --> MR
+    OLF -->|medical-risk-ft preferred| DA
 
     subgraph AGENT["LangGraph Agent (doctor-api)"]
         TN["triage_node"]
@@ -146,8 +151,13 @@ medical-ai-platform/
 │   ├── alb.tf                      # ALB, listener rules, target groups
 │   ├── ecs.tf                      # ECS cluster, task definitions, services
 │   └── ollama.tf                   # EC2 g4dn.xlarge for GPU inference
+├── services/
+│   ├── retrain_worker/             # LoRA fine-tuning worker service
+│   │   ├── Dockerfile
+│   │   ├── requirements.txt        # torch (CPU), peft, transformers, trl, ...
+│   │   └── worker.py               # Polling loop → calls retrain_loop.process_buffer()
 ├── scripts/
-│   └── retrain_loop.py
+│   └── retrain_loop.py             # Full LoRA pipeline (also mountable for manual runs)
 └── data/
 ```
 
@@ -164,9 +174,10 @@ medical-ai-platform/
 | `doctor-portal` | 3001 | Patient list, AI risk panel, feedback form, escalation alerts |
 | `postgres` | 5432 | Single shared database (all tables) |
 | `redis` | 6379 | Risk assessment cache, retrain queue, escalation queue |
-| `ollama` | 11434 | Local LLM inference (llama3 / mistral) |
+| `ollama` | 11434 | Local LLM inference (llama3 / mistral / medical-risk-ft) |
 | `ollama-init` | — | One-shot: pulls llama3 + mistral into shared `ollama_data` volume |
 | `migrate` | — | One-shot: runs `alembic upgrade head` before APIs start |
+| `retrain-worker` | — | Continuous: polls buffer, runs PEFT LoRA training, registers fine-tuned model with Ollama |
 
 ---
 
@@ -293,16 +304,31 @@ doctor-portal
       └── If action == override|flag:
           └── RPUSH retrain_queue  (Redis)
 
+  (also triggered by LangGraph agent when feedback_score < 0.4)
+  → retraining_trigger_node  (agent/nodes.py)
+      └── LPUSH retrain_queue  (Redis)
+
 (manual or scheduled)
   → POST /v1/doctor/retrain/trigger  (doctor-api:8002, requires X-Internal-Key)
       └── LPOP all items from retrain_queue
           └── Append to data/retrain_buffer.jsonl
 
-python3 scripts/retrain_loop.py
-  ├── Read retrain_buffer.jsonl
-  ├── Summarise feedback events
-  ├── Write to retrain_log.jsonl
-  └── Clear buffer
+retrain-worker  (polls every RETRAIN_POLL_INTERVAL_SECONDS, default 5 min)
+  → scripts/retrain_loop.py
+      ├── Check len(buffer) >= MIN_RETRAIN_BATCH (default 5)
+      ├── Query risk_assessments + patient_intake for each assessment_id
+      ├── Build Alpaca {instruction, input, output} examples
+      ├── PEFT LoRA fine-tune TinyLlama-1.1B (CPU, 2 epochs)
+      ├── Merge adapter → save HuggingFace model
+      ├── Convert to GGUF via llama.cpp (convert_hf_to_gguf.py)
+      ├── POST /api/create on Ollama  → medical-risk-ft:latest
+      ├── Write run record to data/retrain_log.jsonl
+      ├── Append to /app/models/registry.json
+      └── Clear buffer (only on success)
+
+doctor-api  (on next risk assessment request)
+  → llm.get_risk_assessment()
+      └── _model_priority_list():  medical-risk-ft → llama3 → mistral → rule_based
 ```
 
 ---
@@ -317,6 +343,10 @@ redis     ──(healthy)──┘                            ├──→  pati
                                                     └──→  postcare-api
 
 ollama ──(healthy)──→  ollama-init  (pulls llama3 + mistral; runs once)
+
+postgres  ──(healthy)──┐
+redis     ──(healthy)──├──→  retrain-worker  (continuous polling loop)
+ollama    ──(healthy)──┘
 
 patient-api  ──(started)──→  patient-portal
 doctor-api   ──(started)──→  doctor-portal
@@ -511,12 +541,20 @@ In production (behind the ALB), all three API services share the same domain and
 |---|---|---|
 | `DATABASE_URL` | all APIs, migrate | SQLAlchemy connection string |
 | `REDIS_URL` | all APIs | Redis connection |
-| `OLLAMA_URL` | doctor-api, postcare-api | Ollama inference endpoint |
+| `OLLAMA_URL` | doctor-api, postcare-api, retrain-worker | Ollama inference endpoint |
 | `JWT_SECRET` | all APIs | HMAC key for HS256 tokens |
 | `FERNET_KEY` | patient-api, doctor-api | AES-256 key for PHI encryption |
 | `INTERNAL_API_KEY` | doctor-api, postcare-api | Header secret for service-to-service calls |
 | `JWT_ALGORITHM` | all APIs | Default: `HS256` |
 | `JWT_EXPIRE_MINUTES` | all APIs | Default: `30` |
+| `FINE_TUNED_MODEL_NAME` | doctor-api, retrain-worker | Ollama model name for fine-tuned model. Default: `medical-risk-ft` |
+| `MIN_RETRAIN_BATCH` | retrain-worker | Min feedback items before training runs. Default: `5` |
+| `RETRAIN_POLL_INTERVAL_SECONDS` | retrain-worker | How often to poll the buffer. Default: `300` |
+| `BASE_MODEL_NAME` | retrain-worker | HuggingFace model to fine-tune. Default: `TinyLlama/TinyLlama-1.1B-Chat-v1.0` |
+| `LORA_RANK` | retrain-worker | LoRA rank `r`. Default: `8` |
+| `LORA_ALPHA` | retrain-worker | LoRA alpha. Default: `16` |
+| `LORA_EPOCHS` | retrain-worker | Training epochs. Default: `2` |
+| `LORA_LR` | retrain-worker | Learning rate. Default: `2e-4` |
 | `NEXT_PUBLIC_PATIENT_API_URL` | patient-portal | Browser-visible patient API base URL |
 | `NEXT_PUBLIC_DOCTOR_API_URL` | doctor-portal | Browser-visible doctor API base URL |
 | `NEXT_PUBLIC_POSTCARE_API_URL` | both portals | Browser-visible postcare API base URL |
@@ -530,6 +568,9 @@ In AWS, all secret values (`JWT_SECRET`, `FERNET_KEY`, `INTERNAL_API_KEY`, `DATA
 | Failure | Behaviour |
 |---|---|
 | Ollama timeout / unavailable | Rule-based fallback (120 s timeout); response has `source: "rule_based"`, confidence `"low"` |
+| Fine-tuned model not yet available | `llm.py` falls back to `llama3` → `mistral` → rule-based automatically |
+| LoRA training failure | Buffer is preserved for retry; failure written to `retrain_log.jsonl` with `"status": "failed"` |
+| GGUF conversion unavailable | Adapter and merged model saved in HuggingFace format; Ollama registration skipped; inference continues with base models |
 | PostgreSQL down | HTTP 503, no stack traces in response body |
 | Redis down | Cache miss treated as no-op; queue pushes fail silently with a log warning |
 | PHI decryption failure | Field returns `None`; request continues |

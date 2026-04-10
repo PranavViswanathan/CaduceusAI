@@ -98,10 +98,27 @@ def _parse_llm_json(raw: str) -> dict:
     return json.loads(candidate)
 
 
+def _available_ollama_models() -> set[str]:
+    try:
+        resp = httpx.get(f"{settings.OLLAMA_URL}/api/tags", timeout=5.0)
+        resp.raise_for_status()
+        return {m.get("name", "").split(":")[0] for m in resp.json().get("models", [])}
+    except Exception:
+        return set()
+
+
+def _model_priority_list() -> list[str]:
+    available = _available_ollama_models()
+    ft_name = settings.FINE_TUNED_MODEL_NAME
+    candidates = [ft_name, "llama3", "mistral"]
+    return [m for m in candidates if m in available] or ["llama3", "mistral"]
+
+
 async def get_risk_assessment(patient_data: dict) -> dict:
     prompt = _build_prompt(patient_data)
+    models = _model_priority_list()
 
-    for model in ("llama3", "mistral"):
+    for model in models:
         try:
             async with httpx.AsyncClient(timeout=120.0) as client:
                 resp = await client.post(
@@ -111,18 +128,18 @@ async def get_risk_assessment(patient_data: dict) -> dict:
                 resp.raise_for_status()
                 raw_text = resp.json().get("response", "")
                 parsed = _parse_llm_json(raw_text)
-                parsed["source"] = "llm"
                 if "risks" not in parsed or "confidence" not in parsed or "summary" not in parsed:
                     raise ValueError("Missing required fields in LLM response")
+                parsed["source"] = f"llm:{model}"
                 return parsed
         except httpx.ConnectError:
-            logger.warning("Ollama not reachable with model %s, trying fallback", model)
+            logger.warning("Ollama not reachable, skipping model %s", model)
             break
         except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
-            logger.warning("Ollama request failed (%s): %s — using rule-based fallback", model, exc)
-            break
+            logger.warning("Ollama request failed (model=%s): %s", model, exc)
+            continue
         except (json.JSONDecodeError, ValueError, KeyError) as exc:
-            logger.warning("LLM response parse error (%s): %s — using rule-based fallback", model, exc)
-            break
+            logger.warning("LLM response parse error (model=%s): %s", model, exc)
+            continue
 
     return rule_based_assessment(patient_data)

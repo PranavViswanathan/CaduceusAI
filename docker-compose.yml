@@ -142,6 +142,38 @@ services:
       NEXT_PUBLIC_DOCTOR_API_URL: http://localhost:8002
       NEXT_PUBLIC_POSTCARE_API_URL: http://localhost:8003
 
+  retrain-worker:
+    build: ./services/retrain_worker
+    env_file: .env
+    environment:
+      RETRAIN_POLL_INTERVAL_SECONDS: "300"
+      MIN_RETRAIN_BATCH: "5"
+      BASE_MODEL_NAME: "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+      FINE_TUNED_MODEL_NAME: "medical-risk-ft"
+      LLAMA_CPP_DIR: "/opt/llama.cpp"
+      MODELS_DIR: "/app/models"
+      RETRAIN_BUFFER_PATH: "/app/data/retrain_buffer.jsonl"
+      RETRAIN_LOG_PATH: "/app/data/retrain_log.jsonl"
+      LORA_RANK: "8"
+      LORA_ALPHA: "16"
+      LORA_EPOCHS: "2"
+      LORA_LR: "2e-4"
+    volumes:
+      - ./data:/app/data
+      - ./scripts:/app/scripts
+      - model_artifacts:/app/models
+      - hf_cache:/root/.cache/huggingface
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    restart: on-failure
+
 volumes:
   postgres_data:
   ollama_data:
+  model_artifacts:
+  hf_cache:

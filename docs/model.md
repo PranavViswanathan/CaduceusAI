@@ -42,9 +42,13 @@ JSON:
 
 ### Model Cascade
 
-1. Try `llama3` first (faster, recommended)
-2. On model-not-found error, retry with `mistral`
-3. Both attempts share a 120-second async timeout (`httpx.AsyncClient`) — CPU inference of llama3 typically takes 30–90 s; GPU inference on `g4dn.xlarge` takes ~2–5 s
+On each request, `_model_priority_list()` calls `GET /api/tags` to discover what is available in Ollama, then returns an ordered list:
+
+1. `medical-risk-ft` — fine-tuned adapter (used if registered after a successful training run)
+2. `llama3` — base model (recommended, ~4.7 GB)
+3. `mistral` — fallback base model (~4.1 GB)
+
+All attempts share a 120-second async timeout (`httpx.AsyncClient`) — CPU inference of llama3 typically takes 30–90 s; GPU inference on `g4dn.xlarge` takes ~2–5 s. The `source` field in the response indicates which model was used (`"llm:medical-risk-ft"`, `"llm:llama3"`, etc.).
 
 ### JSON Extraction
 
@@ -264,7 +268,7 @@ async with httpx.AsyncClient(timeout=120.0) as client:
 
 ## Retraining Pipeline
 
-The feedback loop is the mechanism by which clinician disagreements with LLM outputs feed back into model improvement.
+The feedback loop is the mechanism by which clinician disagreements with LLM outputs feed back into model improvement. The full pipeline runs automatically via the `retrain-worker` Docker service.
 
 ### 1. Feedback Collection
 
@@ -281,7 +285,7 @@ When a doctor submits feedback with `action = override` or `action = flag`, `doc
 }
 ```
 
-Feedback with `action = agree` is stored in the database but **not** queued for retraining.
+Feedback with `action = agree` is stored in the database but **not** queued for retraining. The LangGraph agent's `retraining_trigger_node` also pushes to the same queue when `feedback_score` falls below the configured threshold (default 0.4).
 
 ### 2. Buffer Drain
 
@@ -292,34 +296,84 @@ curl -X POST http://localhost:8002/v1/doctor/retrain/trigger \
   -H "X-Internal-Key: <INTERNAL_API_KEY>"
 ```
 
-### 3. Retrain Loop Script
+### 3. LoRA Fine-Tuning (`scripts/retrain_loop.py`)
 
-`scripts/retrain_loop.py` processes the buffer:
-
-1. Reads `data/retrain_buffer.jsonl` line by line
-2. Parses each feedback event
-3. Prints a summary: patient_id, action, reason, assessment_id
-4. Counts action breakdown (overrides vs flags)
-5. Appends a timestamped run record to `data/retrain_log.jsonl`
-6. Clears `retrain_buffer.jsonl`
+`retrain_loop.py` executes the full training pipeline. It runs continuously inside the `retrain-worker` container, polling every `RETRAIN_POLL_INTERVAL_SECONDS` (default 5 minutes). It can also be invoked manually:
 
 ```bash
 python3 scripts/retrain_loop.py
 ```
 
-### 4. Production LoRA Fine-Tuning (Documented in Script)
+The pipeline only proceeds once the buffer reaches `MIN_RETRAIN_BATCH` items (default 5). If the threshold is not met the buffer is left untouched and the script exits cleanly.
 
-The script's docstring describes the full production pipeline the retrain loop is designed to feed into:
+#### Step-by-step
 
-| Step | Detail |
+| Step | What happens |
 |---|---|
-| **Data reconstruction** | Re-fetch original prompt + response from `risk_assessments` table using `assessment_id` |
-| **Alpaca formatting** | Convert each corrected pair to `{instruction, input, output}` |
-| **Batch threshold** | Accumulate ≥ 50 examples before triggering a training run |
-| **LoRA fine-tuning** | Hugging Face PEFT, target modules `q_proj` + `v_proj`, 4-bit quantization |
-| **Evaluation** | F1 on urgency classification, ROUGE on narrative, false-negative rate on high-risk cases |
-| **Canary rollout** | 10 % traffic for 24 hours before full promotion |
-| **Rollback** | Every version links to its training data, eval results, and contributing feedback items |
+| **Batch check** | Exits early if `len(buffer) < MIN_RETRAIN_BATCH` |
+| **Dataset construction** | For each buffer item, queries `risk_assessments` and `patient_intake` tables via `assessment_id`. Builds an Alpaca-format `{instruction, input, output}` example. `override` feedback uses the doctor's reason as the corrected `summary`; `flag` feedback appends a clinical note to the original assessment. |
+| **LoRA training** | Loads `TinyLlama/TinyLlama-1.1B-Chat-v1.0` from HuggingFace (cached in `hf_cache` Docker volume). Applies PEFT `LoraConfig(r=8, lora_alpha=16)` targeting `q_proj`, `v_proj`, `k_proj`, `o_proj`. Trains for `LORA_EPOCHS` epochs (default 2) on CPU with `learning_rate=2e-4`. |
+| **Merge** | Calls `peft_model.merge_and_unload()` to fold adapter weights into the base model. Saves the merged model to `/app/models/runs/<version>/merged/`. |
+| **GGUF conversion** | Runs `llama.cpp`'s `convert_hf_to_gguf.py` on the merged model to produce a quantized `model.gguf` (q8_0). Skipped gracefully if `llama.cpp` is not available. |
+| **Ollama registration** | Calls `POST /api/create` on Ollama with a Modelfile pointing to the GGUF. Tags the result as both `medical-risk-ft:<version>` and `medical-risk-ft:latest`. |
+| **Model registry** | Appends a run record to `/app/models/registry.json` with version, paths, metrics, and status. |
+| **Buffer clear** | Clears `retrain_buffer.jsonl` only on success. On failure the buffer is preserved for retry and the error is logged. |
+
+#### LoRA configuration
+
+| Hyperparameter | Default | Env var |
+|---|---|---|
+| Base model | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` | `BASE_MODEL_NAME` |
+| LoRA rank | 8 | `LORA_RANK` |
+| LoRA alpha | 16 | `LORA_ALPHA` |
+| Target modules | `q_proj`, `v_proj`, `k_proj`, `o_proj` | — |
+| LoRA dropout | 0.05 | — |
+| Epochs | 2 | `LORA_EPOCHS` |
+| Learning rate | 2e-4 | `LORA_LR` |
+| Batch size | 1 (grad accum 4) | — |
+| Min batch size | 5 | `MIN_RETRAIN_BATCH` |
+| Poll interval | 300 s | `RETRAIN_POLL_INTERVAL_SECONDS` |
+
+### 4. Fine-Tuned Model Inference
+
+After a successful training run, `doctor-api` automatically prefers the fine-tuned model. On each risk assessment request, `llm.py` calls `GET /api/tags` on Ollama, then tries models in this priority order:
+
+```
+medical-risk-ft  →  llama3  →  mistral  →  rule-based fallback
+```
+
+The fine-tuned model is only used if it is registered in Ollama. If GGUF conversion fails (e.g., no llama.cpp), inference continues with the base models unchanged — training output is still persisted in HuggingFace format under `/app/models/runs/<version>/`.
+
+The `source` field on risk assessment responses reflects which model was used: `"llm:medical-risk-ft"`, `"llm:llama3"`, or `"rule_based"`.
+
+### 5. Monitoring Training Runs
+
+```bash
+# Check buffer depth and recent runs (requires doctor auth)
+curl http://localhost:8002/v1/doctor/retrain/status \
+  -H "Authorization: Bearer <token>"
+```
+
+Response:
+```json
+{
+  "buffer_items_pending": 3,
+  "total_runs": 2,
+  "runs": [
+    {
+      "version": "20260410T120000Z",
+      "status": "success",
+      "items_used": 7,
+      "examples_built": 7,
+      "ollama_model": "medical-risk-ft:20260410T120000Z",
+      "base_model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+      "epochs": 2
+    }
+  ]
+}
+```
+
+The full run history is also written line-by-line to `data/retrain_log.jsonl`.
 
 ---
 

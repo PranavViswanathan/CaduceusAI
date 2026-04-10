@@ -317,6 +317,31 @@ def submit_feedback(
     return {"status": "recorded"}
 
 
+@router.get("/doctor/retrain/status")
+def retrain_status(current_doctor: Doctor = Depends(get_current_doctor)):
+    """Return recent training run history from the model registry."""
+    registry_path = Path("/app/models/registry.json")
+    runs: list[dict] = []
+    if registry_path.exists():
+        try:
+            runs = json.loads(registry_path.read_text())
+        except Exception:
+            runs = []
+
+    buffer_items = 0
+    if RETRAIN_BUFFER.exists():
+        try:
+            buffer_items = sum(1 for line in RETRAIN_BUFFER.read_text().splitlines() if line.strip())
+        except Exception:
+            pass
+
+    return {
+        "buffer_items_pending": buffer_items,
+        "total_runs": len(runs),
+        "runs": runs[-10:],  # last 10 runs
+    }
+
+
 @router.post("/doctor/retrain/trigger")
 def trigger_retrain(x_internal_key: Annotated[str | None, Header()] = None):
     if x_internal_key != settings.INTERNAL_API_KEY:

@@ -54,9 +54,10 @@ The stack is fully containerized: FastAPI backends, Next.js 14 frontends, Postgr
 | `postcare-api` | 8003 | Care plan generation, follow-up check-ins, escalations |
 | `postgres` | 5432 | Primary database (shared by all services) |
 | `redis` | 6379 | Cache, retrain queue, escalation queue |
-| `ollama` | 11434 | Local LLM inference (llama3 / mistral) |
+| `ollama` | 11434 | Local LLM inference (llama3 / mistral / medical-risk-ft) |
 | `ollama-init` | — | One-shot service that pulls llama3 + mistral on first boot |
 | `migrate` | — | One-shot service that runs Alembic migrations before APIs start |
+| `retrain-worker` | — | Continuous PEFT LoRA training loop; registers fine-tuned model with Ollama |
 
 ---
 
@@ -98,8 +99,9 @@ Docker Compose handles the complete startup sequence automatically:
 3. **ollama** starts; **ollama-init** pulls `llama3` and `mistral` (~4.7 GB + ~4.1 GB on first run — this may take several minutes). If `ollama-init` is slow or fails, models can be pulled manually (see Troubleshooting below).
 4. All three API services start once `migrate` completes
 5. Both frontend portals start
+6. **retrain-worker** starts and begins polling for feedback data (depends on postgres, redis, and ollama being healthy)
 
-Model weights are stored in a Docker volume (`ollama_data`) and only downloaded on first boot.
+Model weights are stored in Docker volumes (`ollama_data`, `hf_cache`, `model_artifacts`) and are only downloaded/trained once. The first LoRA training run also downloads the `TinyLlama-1.1B` base model from HuggingFace (~2.2 GB).
 
 ### 3. Access the apps
 
@@ -205,28 +207,41 @@ The `TESTING=true` environment variable skips database `create_all()` on startup
 
 ---
 
-## Retrain Loop Script
+## LoRA Retraining
 
-The retrain loop script processes clinician feedback that was flagged for model improvement.
+The `retrain-worker` service runs a continuous polling loop that automatically fine-tunes the risk assessment model from clinician feedback.
+
+**How it works:**
+
+1. Doctors submit feedback (`override` or `flag`) via the doctor portal
+2. Feedback is queued in Redis (`retrain_queue`)
+3. Drain the queue into the buffer:
+   ```bash
+   curl -X POST http://localhost:8002/v1/doctor/retrain/trigger \
+     -H "X-Internal-Key: <INTERNAL_API_KEY>"
+   ```
+4. `retrain-worker` polls the buffer every 5 minutes. Once `MIN_RETRAIN_BATCH` items accumulate (default 5), it:
+   - Fetches original assessment context from PostgreSQL
+   - Builds an Alpaca-format training dataset
+   - Fine-tunes `TinyLlama-1.1B` with PEFT LoRA (CPU, ~2 epochs)
+   - Merges the adapter and converts to GGUF via llama.cpp
+   - Registers `medical-risk-ft:latest` with Ollama
+5. `doctor-api` automatically prefers `medical-risk-ft` over `llama3` / `mistral` once it is registered
+
+**Check training status:**
+
+```bash
+curl http://localhost:8002/v1/doctor/retrain/status \
+  -H "Authorization: Bearer <token>"
+```
+
+**Run manually:**
 
 ```bash
 python3 scripts/retrain_loop.py
 ```
 
-Or from within Docker:
-
-```bash
-docker compose exec doctor-api python /app/retrain_loop.py
-```
-
-Trigger the retrain queue drain via the API:
-
-```bash
-curl -X POST http://localhost:8002/v1/doctor/retrain/trigger \
-  -H "X-Internal-Key: internal-service-api-key-change-in-production"
-```
-
-See [AI Model & LLM](docs/model.md) for the full retraining pipeline.
+See [AI Model & LLM](docs/model.md) for full pipeline details, hyperparameter reference, and configuration options.
 
 ---
 
