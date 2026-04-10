@@ -68,6 +68,27 @@ graph TD
     RB2 --> RS
     RS --> RL
 
+    subgraph AGENT["LangGraph Agent (doctor-api)"]
+        TN["triage_node"]
+        RAN["rag_node"]
+        REN["reasoning_node"]
+        EN["escalation_node"]
+        RT["retraining_trigger_node"]
+        AE[("agent_escalations\nPHI-encrypted")]
+        TN -->|routine| RAN
+        TN -->|complex| REN
+        TN -->|urgent| EN
+        REN -->|conf≥0.5| RT
+        REN -->|conf<0.5| EN
+        RAN --> RT
+        EN --> AE
+    end
+
+    DA <-->|/v1/agent/query| AGENT
+    AGENT -->|audit_log write| PG
+    AGENT -->|retrain_queue lpush| RD
+    AGENT -->|triage + RAG + CoT prompts| OL
+
     DA -->|risk prompt| OL
     PCA -->|care plan + urgency prompt| OL
     OL -->|unavailable| RB
@@ -85,6 +106,7 @@ graph TD
     style INFRA fill:transparent,stroke:#888780,stroke-width:1.5px,stroke-dasharray:5 4
     style FALLBACK fill:transparent,stroke:#BA7517,stroke-width:1.5px,stroke-dasharray:5 4
     style RETRAIN fill:transparent,stroke:#D85A30,stroke-width:1.5px,stroke-dasharray:5 4
+    style AGENT fill:transparent,stroke:#2D7DD2,stroke-width:1.5px,stroke-dasharray:5 4
 ```
 
 ---
@@ -120,15 +142,24 @@ medical-ai-platform/
 │   │       ├── test_auth.py        # Registration, login, logout, validation
 │   │       └── test_patients.py    # Intake, profile retrieval, auth guards
 │   ├── doctor_api/                 # Tier 2 backend  (port 8002)
-│   │   ├── main.py                 # Routes: /v1/auth, /v1/doctor, /v1/escalations, /health
+│   │   ├── main.py                 # Routes: /v1/auth, /v1/doctor, /v1/escalations, /v1/agent, /health
 │   │   ├── models.py               # ORM: Doctor, RiskAssessment, Feedback, Escalation
 │   │   ├── schemas.py              # Pydantic: DoctorRegister, FeedbackCreate, LoginResponse
 │   │   ├── llm.py                  # Ollama + rule-based risk assessment
 │   │   ├── auth.py                 # Cookie-first JWT auth + doctor-role guard
 │   │   ├── encryption.py           # Field decryption (reads encrypted DOB)
+│   │   ├── langgraph.json          # LangGraph Studio config pointing to agent/graph.py:graph
 │   │   ├── requirements.txt
 │   │   ├── requirements-test.txt
 │   │   ├── Dockerfile
+│   │   ├── agent/                  # LangGraph orchestration layer
+│   │   │   ├── __init__.py
+│   │   │   ├── state.py            # AgentState TypedDict (14 typed fields)
+│   │   │   ├── models.py           # ORM: AgentEscalation (agent_escalations table)
+│   │   │   ├── knowledge_base.py   # In-memory medical KB + term-frequency retrieval
+│   │   │   ├── nodes.py            # triage / rag / reasoning / escalation / retraining nodes
+│   │   │   ├── graph.py            # StateGraph wiring + compiled graph export
+│   │   │   └── router.py           # FastAPI router: POST /v1/agent/query, GET /v1/agent/graph
 │   │   └── tests/
 │   │       ├── conftest.py
 │   │       ├── test_auth.py
@@ -177,7 +208,7 @@ medical-ai-platform/
 | Service | Port | Owns |
 |---|---|---|
 | `patient-api` | 8001 | Patient auth, intake storage, encrypted PHI |
-| `doctor-api` | 8002 | Doctor auth, LLM risk assessment, feedback, retrain queue |
+| `doctor-api` | 8002 | Doctor auth, LLM risk assessment, feedback, retrain queue, LangGraph agent |
 | `postcare-api` | 8003 | Care plan generation, follow-up check-ins, escalation creation |
 | `patient-portal` | 3000 | Patient registration, intake wizard, care plan dashboard |
 | `doctor-portal` | 3001 | Patient list, AI risk panel, feedback form, escalation alerts |
@@ -266,6 +297,42 @@ patient-portal (or API client)
 doctor-portal
   → polls GET /v1/escalations/pending  every 60s  (postcare-api:8003)
   → POST /v1/escalations/{id}/acknowledge
+```
+
+### Agent Query (LangGraph)
+
+```
+doctor-portal (or API client)
+  → POST /v1/agent/query  (doctor-api:8002)
+      ├── Validate JWT + assert role=doctor
+      ├── Invoke LangGraph graph (5-node StateGraph)
+      │
+      │   triage_node
+      │     └── Ollama: classify query as routine / complex / urgent
+      │         (fallback: "complex" if Ollama unreachable)
+      │
+      │   [routine path]
+      │     rag_node
+      │       ├── Retrieve top-3 docs from in-memory KB
+      │       └── Ollama: synthesise answer from context
+      │     retraining_trigger_node
+      │       ├── Check feedback_score < RETRAIN_SCORE_THRESHOLD (0.4)?
+      │       │   └── YES → LPUSH retrain_queue (Redis)
+      │       └── Write AuditLog row → END
+      │
+      │   [complex path, confidence ≥ 0.5]
+      │     reasoning_node
+      │       └── Ollama: chain-of-thought reasoning
+      │     retraining_trigger_node → AuditLog → END
+      │
+      │   [complex path, confidence < 0.5]  OR  [urgent path]
+      │     escalation_node
+      │       ├── encrypt(query) → AgentEscalation row (PostgreSQL)
+      │       └── Write AuditLog row → END
+      │
+      └── Return AgentQueryResponse
+          { query_type, response, confidence,
+            requires_escalation, escalation_id, chain_of_thought }
 ```
 
 ### Feedback → Retraining

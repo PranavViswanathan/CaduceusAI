@@ -26,6 +26,8 @@ from models import AuditLog, Doctor, Escalation, FollowupCheckin, Patient, Patie
 from schemas import DoctorRegister, FeedbackCreate, LoginResponse, PatientListItem, RiskAssessmentResponse
 from settings import settings
 
+from agent.router import agent_router
+
 logger = logging.getLogger(__name__)
 
 _TESTING = os.getenv("TESTING", "false").lower() == "true"
@@ -367,6 +369,7 @@ def pending_escalations(
 
 
 app.include_router(router)
+app.include_router(agent_router)
 
 
 @app.get("/health")

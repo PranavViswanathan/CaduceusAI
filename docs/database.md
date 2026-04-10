@@ -184,6 +184,25 @@ Created automatically when a check-in is classified as `escalate`. Doctors ackno
 
 ---
 
+### `agent_escalations`
+
+Created by `escalation_node` in the LangGraph agent when a query is classified as `urgent` or when `reasoning_node` returns confidence < 0.5. Kept separate from the `escalations` table (which requires a `followup_checkins` FK) so the agent layer remains decoupled from postcare workflows.
+
+| Column | Type | Constraints | Notes |
+|---|---|---|---|
+| `id` | UUID | PK, default `uuid_generate_v4()` | |
+| `patient_id` | UUID | nullable | Patient associated with the query (if provided) |
+| `query_encrypted` | String | NOT NULL | Fernet/AES-256 ciphertext of the raw query text |
+| `query_type` | String | NOT NULL | Triage classification that triggered escalation: `urgent` or `complex` |
+| `reason` | Text | nullable | Human-readable explanation of why escalation occurred |
+| `actor_id` | UUID | nullable | Doctor UUID who submitted the query |
+| `acknowledged` | Boolean | default `false` | Set to `true` once a clinician has reviewed |
+| `created_at` | DateTime | default `now()` | |
+
+**Notes**: `query_encrypted` stores the query text PHI-encrypted (same Fernet key as `patients.dob_encrypted`) so no clinical query rests in plaintext in the database. This table is created at startup via `Base.metadata.create_all()` — no Alembic migration is required for new installs; existing installs should add a migration.
+
+---
+
 ### `audit_log`
 
 Append-only log of all write operations. PHI values are never written here — only actor IDs, patient IDs, and action descriptions.
@@ -212,6 +231,7 @@ patients ──< risk_assessments >── doctors
 patients ──< feedback          >── doctors
 patients ──< care_plans
 patients ──< followup_checkins ──< escalations
+patients ──< agent_escalations >── doctors   (via patient_id / actor_id; both nullable)
 ```
 
 ---
@@ -235,6 +255,10 @@ CREATE INDEX ON escalations (acknowledged, created_at DESC);
 
 -- Audit log queries by patient
 CREATE INDEX ON audit_log (patient_id, timestamp DESC);
+
+-- Agent escalation queries (unacknowledged, by patient)
+CREATE INDEX ON agent_escalations (acknowledged, created_at DESC);
+CREATE INDEX ON agent_escalations (patient_id, created_at DESC);
 ```
 
 ---

@@ -63,8 +63,9 @@ Exceeded limits return HTTP 429. When `TESTING=true`, limits are raised to 1000/
 | Field | Table | Method |
 |---|---|---|
 | `dob_encrypted` | `patients` | AES-256 via Fernet (symmetric) |
+| `query_encrypted` | `agent_escalations` | AES-256 via Fernet (symmetric) |
 
-Date of birth is the only field classified as requiring encryption at rest. All other fields (name, email, phone) are stored plaintext. Passwords are hashed and never recoverable.
+Date of birth and escalated agent query text are the fields classified as requiring encryption at rest. Agent queries that reach `escalation_node` may contain patient-identifying clinical language, so the raw query is encrypted before any PostgreSQL write using the same `encrypt()` function and `FERNET_KEY`. All other fields (name, email, phone) are stored plaintext. Passwords are hashed and never recoverable.
 
 ### How it works
 
@@ -163,6 +164,8 @@ allow_credentials=True
 | `POST /v1/doctor/patients/{id}/feedback` | Any authenticated doctor |
 | `GET /v1/escalations/pending` | Any authenticated doctor |
 | `POST /v1/escalations/{id}/acknowledge` | Any authenticated doctor |
+| `POST /v1/agent/query` | Any authenticated doctor |
+| `GET /v1/agent/graph` | Any authenticated doctor |
 | `POST /v1/careplan/generate` | Internal key only |
 | `POST /v1/doctor/retrain/trigger` | Internal key only |
 
@@ -175,7 +178,14 @@ Patients cannot access any `doctor-api` or `postcare-api` doctor routes. There i
 Every write operation across all three APIs is recorded in `audit_log`:
 
 - **What is logged**: service, route, actor_id, patient_id, action label, outcome, IP address, timestamp
-- **What is never logged**: PHI values (DOB, symptoms, medications), plaintext passwords, JWT tokens
+- **What is never logged**: PHI values (DOB, symptoms, medications, query text), plaintext passwords, JWT tokens
+
+The LangGraph agent writes one audit log entry per request at the terminal node of each execution path. Agent action labels:
+
+| Action | Set by | Meaning |
+|---|---|---|
+| `agent_escalation` | `escalation_node` | Query escalated to clinician review queue |
+| `agent_query_complete` | `retraining_trigger_node` | Query answered successfully; outcome field shows `query_type` or `retrain_enqueued` |
 
 Audit log writes are wrapped in a try/except — a logging failure must not block a legitimate clinical operation.
 

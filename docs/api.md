@@ -309,6 +309,70 @@ Same format as patient-api health response.
 
 ---
 
+### Agent
+
+The agent endpoints expose the LangGraph orchestration layer. All routes require a `doctor_access_token` cookie (or `Authorization: Bearer` fallback).
+
+#### `POST /v1/agent/query`
+
+Submit a clinical query to the five-node LangGraph agent. The agent automatically triages the query, selects the appropriate reasoning path (RAG, chain-of-thought, or escalation), and writes an audit log entry before returning.
+
+**Request body**:
+```json
+{
+  "query": "What is the first-line treatment for hypertension in a diabetic patient?",
+  "patient_id": "<uuid>",
+  "feedback_score": 0.2,
+  "feedback_assessment_id": "<uuid>"
+}
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `query` | String | Yes | The clinical question or instruction |
+| `patient_id` | UUID | No | Attaches to audit and escalation records |
+| `feedback_score` | Float 0.0–1.0 | No | Clinician score for a **prior** agent response. If below `RETRAIN_SCORE_THRESHOLD` (default 0.4), a retraining job is enqueued to Redis |
+| `feedback_assessment_id` | UUID | No | Assessment UUID linked to the feedback score |
+
+**Response** `200`:
+```json
+{
+  "query_type": "routine",
+  "response": "First-line antihypertensives for diabetic patients include ACE inhibitors (e.g. lisinopril) or ARBs...",
+  "confidence": 0.82,
+  "requires_escalation": false,
+  "escalation_id": null,
+  "chain_of_thought": null
+}
+```
+
+| Field | Notes |
+|---|---|
+| `query_type` | `routine` / `complex` / `urgent` — set by triage_node |
+| `response` | Final answer or `"This query has been flagged for clinician review."` when escalated |
+| `confidence` | Float 0.0–1.0; `0.0` when escalated |
+| `requires_escalation` | `true` if routed through escalation_node |
+| `escalation_id` | UUID of the created `agent_escalations` record, or `null` |
+| `chain_of_thought` | Step-by-step reasoning from reasoning_node, or `null` |
+
+**Graph routing**:
+- `routine` → RAG retrieval → retrain check → response
+- `complex` → chain-of-thought reasoning → (confidence ≥ 0.5) → retrain check → response
+- `complex` → chain-of-thought reasoning → (confidence < 0.5) → escalated
+- `urgent` → escalated immediately
+
+**Error** `503`: Agent temporarily unavailable (graph execution failure).
+
+---
+
+#### `GET /v1/agent/graph`
+
+Return the LangGraph graph structure as JSON for developer tooling and LangGraph Studio visualisation. Requires a doctor session.
+
+**Response** `200`: JSON object describing nodes, edges, and conditional routing as returned by LangGraph's built-in graph introspection (`graph.get_graph().to_json()`).
+
+---
+
 ## PostCare API (port 8003)
 
 ### Care Plans

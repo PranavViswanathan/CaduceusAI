@@ -8,12 +8,12 @@ A local-first, three-tier medical AI platform using FastAPI, Next.js 14, Postgre
 
 | Doc | Description |
 |---|---|
-| [Architecture](docs/architecture.md) | Full system design — tiers, services, request flows, Docker orchestration, failure modes |
-| [AI Model & LLM](docs/model.md) | Ollama integration, prompt design, rule-based fallbacks, retraining pipeline, assessment versioning |
-| [Database Schema](docs/database.md) | All tables, columns, constraints, relationships, and recommended indexes |
+| [Architecture](docs/architecture.md) | Full system design — tiers, services, LangGraph agent, request flows, Docker orchestration, failure modes |
+| [AI Model & LLM](docs/model.md) | Ollama integration, LangGraph agent nodes, prompt design, rule-based fallbacks, retraining pipeline |
+| [Database Schema](docs/database.md) | All tables (incl. `agent_escalations`), columns, constraints, relationships, and recommended indexes |
 | [API Reference](docs/api.md) | Every endpoint across all three services with request/response examples |
 | [Frontend Portals](docs/frontend.md) | Patient and doctor portals — pages, data flows, API clients, auth helpers |
-| [Security Model](docs/security.md) | Auth, PHI encryption, CORS, audit logging, and production hardening checklist |
+| [Security Model](docs/security.md) | Auth, PHI encryption (incl. agent query text), CORS, audit logging, and production hardening checklist |
 
 ---
 
@@ -117,6 +117,14 @@ curl -X POST http://localhost:8002/v1/auth/register \
 curl -X POST http://localhost:8001/v1/auth/register \
   -H "Content-Type: application/json" \
   -d '{"email":"patient@example.com","password":"Password123","name":"Jane Doe","dob":"1990-05-14","sex":"female"}'
+```
+
+```bash
+# Submit a clinical query to the LangGraph agent (requires doctor session cookie)
+curl -X POST http://localhost:8002/v1/agent/query \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <doctor_token>" \
+  -d '{"query": "What is the first-line treatment for hypertension in a diabetic patient?"}'
 ```
 
 ---
@@ -226,7 +234,7 @@ The `ollama/ollama` image does not include `curl`. The healthcheck uses `ollama 
 
 ## Security Notes
 
-- All sensitive fields (DOB) are AES-256 encrypted at rest using Fernet
+- All sensitive fields (DOB, escalated agent query text) are AES-256 encrypted at rest using Fernet
 - Passwords are bcrypt-hashed
 - JWTs use HS256, expire after 30 minutes, and are stored in **httpOnly cookies** (never in localStorage)
 - Auth cookies are set with `SameSite=None; Secure; HttpOnly; Domain=localhost`, allowing them to be shared across the three API ports on localhost
@@ -298,6 +306,14 @@ medical-ai-platform/
 │   │   ├── main.py
 │   │   ├── llm.py                      # Ollama + rule-based fallback
 │   │   ├── models.py
+│   │   ├── langgraph.json              # LangGraph Studio config
+│   │   ├── agent/                      # LangGraph orchestration layer
+│   │   │   ├── state.py                # AgentState TypedDict
+│   │   │   ├── models.py               # AgentEscalation ORM model
+│   │   │   ├── knowledge_base.py       # In-memory medical KB for RAG
+│   │   │   ├── nodes.py                # 5 agent nodes
+│   │   │   ├── graph.py                # StateGraph + compiled graph export
+│   │   │   └── router.py               # /v1/agent/query + /v1/agent/graph
 │   │   ├── requirements.txt
 │   │   ├── requirements-test.txt
 │   │   └── tests/

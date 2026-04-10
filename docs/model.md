@@ -11,6 +11,9 @@ The platform uses **Ollama** for fully local LLM inference. No data ever leaves 
 | Service | Function | Input | Output |
 |---|---|---|---|
 | `doctor-api` | Risk assessment | Patient intake (conditions, meds, allergies, symptoms) | `risks[]`, `confidence`, `summary` |
+| `doctor-api` | Agent triage | Clinical query text | `routine` / `complex` / `urgent` |
+| `doctor-api` | Agent RAG response | Query + retrieved KB docs | `response`, `confidence` |
+| `doctor-api` | Agent chain-of-thought | Complex clinical query | `chain_of_thought`, `response`, `confidence` |
 | `postcare-api` | Care plan generation | Visit notes | `follow_up_date`, `medications_to_monitor[]`, `lifestyle_recommendations[]`, `warning_signs[]` |
 | `postcare-api` | Urgency classification | Symptom report + care plan warning signs | `routine` / `monitor` / `escalate` |
 
@@ -276,6 +279,108 @@ The script's docstring describes the full production pipeline the retrain loop i
 | **Evaluation** | F1 on urgency classification, ROUGE on narrative, false-negative rate on high-risk cases |
 | **Canary rollout** | 10 % traffic for 24 hours before full promotion |
 | **Rollback** | Every version links to its training data, eval results, and contributing feedback items |
+
+---
+
+---
+
+## LangGraph Agentic Orchestration (doctor-api)
+
+### Files: `services/doctor_api/agent/`
+
+The agent layer is a LangGraph `StateGraph` that routes each clinical query through a pipeline of five specialised nodes. It is exposed via `POST /v1/agent/query` and reuses the existing Ollama client, PostgreSQL session, Redis client, and PHI encryption — no new connections are created.
+
+### Typed State
+
+All inter-node data flows through `AgentState` (a `TypedDict`) defined in `agent/state.py`. Key fields:
+
+| Field | Type | Set by |
+|---|---|---|
+| `query` | str | router (request input) |
+| `query_type` | str | triage_node |
+| `rag_context` | list[str] | rag_node |
+| `chain_of_thought` | str | reasoning_node |
+| `response` | str | rag_node / reasoning_node / escalation_node |
+| `confidence` | float | rag_node / reasoning_node |
+| `requires_escalation` | bool | escalation_node |
+| `escalation_id` | str \| None | escalation_node |
+| `feedback_score` | float \| None | router (request input) |
+
+### Graph Topology
+
+```
+triage_node  ← entry point
+    │
+    ├── "routine"  ──→  rag_node  ──────────────────→  retraining_trigger_node  →  END
+    │
+    ├── "complex"  ──→  reasoning_node  ──(conf ≥ 0.5)──→  retraining_trigger_node  →  END
+    │                        │
+    │                        └──(conf < 0.5)──→  escalation_node  →  END
+    │
+    └── "urgent"  ──────────────────────────────────→  escalation_node  →  END
+```
+
+Audit log entries are written only at terminal nodes (`retraining_trigger_node` and `escalation_node`) — one entry per request.
+
+### Node Reference
+
+#### `triage_node`
+
+Calls Ollama with a structured prompt that defines `routine`, `complex`, and `urgent` in clinical terms. Expects a JSON response `{"classification": "..."}`. Falls back to `"complex"` (the safest default) if Ollama is unreachable or returns an unexpected label. Timeout: 30 s.
+
+#### `rag_node`
+
+Handles **routine** queries. Retrieves the top-3 matching documents from an in-memory medical knowledge base (`agent/knowledge_base.py`) using term-frequency scoring, then prompts Ollama to answer grounded in that context. Returns `response` and `confidence`. Timeout: 60 s.
+
+The knowledge base contains 12 clinical reference paragraphs (hypertension, T2DM, sepsis, AF, AKI, pneumonia, opioids, etc.) and is designed to be replaced with a proper vector store (pgvector, Chroma) in production.
+
+#### `reasoning_node`
+
+Handles **complex** queries using chain-of-thought (CoT) prompting. The prompt instructs Ollama to reason step-by-step and produce a JSON object with `chain_of_thought`, `response`, and `confidence`. Timeout: 120 s. If `confidence < 0.5`, the graph routes to `escalation_node`.
+
+#### `escalation_node`
+
+Handles **urgent** queries and low-confidence complex queries. Creates an `AgentEscalation` record in PostgreSQL with the raw query stored PHI-encrypted (Fernet/AES-256 via the existing `encrypt()` function). Returns a `"pending clinician review"` response. Writes the terminal audit log entry.
+
+#### `retraining_trigger_node`
+
+Runs at the end of every non-escalation path. Checks whether `feedback_score` (passed in from the API request) falls below `RETRAIN_SCORE_THRESHOLD` (default 0.4, overridable via env var). If so, pushes a payload to the Redis `retrain_queue` using the same JSON format as the existing feedback pipeline:
+
+```json
+{
+  "patient_id": "<uuid>",
+  "assessment_id": "<uuid>",
+  "feedback_score": 0.2,
+  "action": "agent_low_score",
+  "timestamp": "2026-04-10T12:00:00Z"
+}
+```
+
+Always writes the terminal audit log entry regardless of whether a retrain job was enqueued.
+
+### LangGraph Studio
+
+The compiled graph is exported as the module-level variable `graph` in `agent/graph.py`. The `langgraph.json` config at the service root points LangGraph Studio to it:
+
+```json
+{
+  "graphs": { "caduceus_agent": "./agent/graph.py:graph" },
+  "env": ".env"
+}
+```
+
+The `GET /v1/agent/graph` endpoint returns the same graph structure as JSON for custom visualisation tooling.
+
+### Dependencies Injected via RunnableConfig
+
+Nodes do not open new database or Redis connections. The FastAPI-managed `db` session and the result of `_get_redis()` are injected via `config["configurable"]` at invocation time:
+
+```python
+result = await graph.ainvoke(
+    initial_state,
+    config={"configurable": {"db": db, "redis": redis}},
+)
+```
 
 ---
 
