@@ -1,6 +1,12 @@
 # CaduceusAI Platform — Three-Tier Medical AI System
 
-A local-first, three-tier medical AI platform using FastAPI, Next.js 14, PostgreSQL, Redis, and Ollama for local LLM inference.
+**CaduceusAI** is a local-first, three-tier medical AI platform that covers the full patient journey — from intake to clinical decision support to post-care follow-up  with all LLM inference running on-device via Ollama. No patient data ever leaves the host.
+
+The system is split across three independently deployable tiers: a patient-facing portal for registration, intake, and care plan review; a clinical decision support layer where doctors get AI-generated risk assessments with confidence scoring and can submit feedback to correct the model; and a post-care service that generates structured care plans from visit notes and triages follow-up symptom reports into `routine`, `monitor`, or `escalate` urgency levels.
+
+AI assessments are powered by `llama3` or `mistral` running locally, with automatic fallback to deterministic rule-based checks (drug interaction detection, keyword triage) when Ollama is unavailable or times out. Clinician disagreements — overrides and flags — are queued in Redis and drained into a retraining buffer designed to feed a LoRA fine-tuning pipeline.
+
+The stack is fully containerized: FastAPI backends, Next.js 14 frontends, PostgreSQL, Redis, and Ollama all orchestrated via Docker Compose with automatic schema migrations (Alembic) and model pulls on first boot. Security is treated seriously — PHI is AES-256 encrypted at rest, passwords are bcrypt-hashed, JWTs live exclusively in httpOnly cookies, and every write operation is recorded in an append-only audit log.
 
 ---
 
