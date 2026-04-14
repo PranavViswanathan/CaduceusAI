@@ -1,10 +1,16 @@
-"""Lightweight in-memory knowledge base used by rag_node for routine queries.
+"""Clinical knowledge base backed by ChromaDB for semantic vector search.
 
-Each entry is a plain-text clinical reference paragraph.  Retrieval is done
-with a simple term-frequency score so that no additional dependencies are
-required.  In production this module should be swapped for a proper vector
-store (pgvector, Chroma, Weaviate, etc.).
+Documents are embedded at startup using the default sentence-transformer model
+(``all-MiniLM-L6-v2`` via ONNX).  Retrieval uses cosine similarity so that
+semantically related queries match even when exact keywords differ.
+
+Swap ``chromadb.EphemeralClient`` for ``chromadb.HttpClient`` (or
+``chromadb.PersistentClient``) to move to a persistent / shared store in
+production.
 """
+
+import chromadb
+from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
 
 _DOCUMENTS: list[str] = [
     (
@@ -92,19 +98,24 @@ _DOCUMENTS: list[str] = [
     ),
 ]
 
+_client = chromadb.EphemeralClient()
+_collection = _client.get_or_create_collection(
+    name="clinical_kb",
+    embedding_function=DefaultEmbeddingFunction(),
+    metadata={"hnsw:space": "cosine"},
+)
+_collection.add(
+    documents=_DOCUMENTS,
+    ids=[f"doc_{i}" for i in range(len(_DOCUMENTS))],
+)
+
 
 def retrieve(query: str, k: int = 3) -> list[str]:
-    """Return the top-k knowledge-base documents most relevant to *query*.
+    """Return the top-k documents most semantically similar to *query*.
 
-    Relevance is scored by the number of query words that appear in each
-    document (case-insensitive).  Documents with zero matches are excluded.
-    This is intentionally simple — replace with a vector similarity search
-    when a vector store is available.
+    Uses cosine similarity over sentence-transformer embeddings so that
+    related medical concepts match even without exact keyword overlap.
     """
-    query_tokens = set(query.lower().split())
-    scored = [
-        (doc, sum(1 for token in query_tokens if token in doc.lower()))
-        for doc in _DOCUMENTS
-    ]
-    scored.sort(key=lambda pair: pair[1], reverse=True)
-    return [doc for doc, score in scored[:k] if score > 0]
+    n_results = min(k, len(_DOCUMENTS))
+    results = _collection.query(query_texts=[query], n_results=n_results)
+    return results["documents"][0]

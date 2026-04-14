@@ -16,3 +16,4 @@ alembic==1.13.1
 email-validator==2.1.1
 langgraph==0.2.55
 langchain-core==0.2.40
+chromadb==0.5.23
