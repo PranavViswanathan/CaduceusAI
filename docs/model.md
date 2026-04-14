@@ -423,9 +423,9 @@ Calls Ollama with a structured prompt that defines `routine`, `complex`, and `ur
 
 #### `rag_node`
 
-Handles **routine** queries. Retrieves the top-3 matching documents from an in-memory medical knowledge base (`agent/knowledge_base.py`) using term-frequency scoring, then prompts Ollama to answer grounded in that context. Returns `response` and `confidence`. Timeout: 60 s.
+Handles **routine** queries. Retrieves the top-3 semantically similar documents from the clinical knowledge base (`agent/knowledge_base.py`) using ChromaDB vector search (cosine similarity over `all-MiniLM-L6-v2` sentence-transformer embeddings), then prompts Ollama to answer grounded in that context. Returns `response` and `confidence`. Timeout: 60 s.
 
-The knowledge base contains 12 clinical reference paragraphs (hypertension, T2DM, sepsis, AF, AKI, pneumonia, opioids, etc.) and is designed to be replaced with a proper vector store (pgvector, Chroma) in production.
+The knowledge base contains 12 clinical reference paragraphs (hypertension, T2DM, sepsis, AF, AKI, pneumonia, opioids, etc.) stored in a ChromaDB ephemeral collection initialised at startup. Semantic matching means related concepts match even without exact keyword overlap (e.g., "blood pressure control" matches "hypertension management"). For production, swap `chromadb.EphemeralClient()` for `chromadb.PersistentClient()` (SQLite-backed) or `chromadb.HttpClient()` (separate Chroma server) to persist embeddings across restarts.
 
 #### `reasoning_node`
 
@@ -450,6 +450,68 @@ Runs at the end of every non-escalation path. Checks whether `feedback_score` (p
 ```
 
 Always writes the terminal audit log entry regardless of whether a retrain job was enqueued.
+
+### Clinical Knowledge Base (ChromaDB)
+
+#### File: `services/doctor_api/agent/knowledge_base.py`
+
+The knowledge base is a ChromaDB collection that stores 12 clinical reference paragraphs as dense vector embeddings. It is initialised once at process startup — all documents are embedded and loaded into memory before the first request is served.
+
+**Setup:**
+
+```python
+import chromadb
+from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
+
+_client = chromadb.EphemeralClient()
+_collection = _client.get_or_create_collection(
+    name="clinical_kb",
+    embedding_function=DefaultEmbeddingFunction(),  # all-MiniLM-L6-v2 via ONNX
+    metadata={"hnsw:space": "cosine"},
+)
+_collection.add(documents=_DOCUMENTS, ids=[f"doc_{i}" for i in range(len(_DOCUMENTS))])
+```
+
+**Retrieval:**
+
+```python
+def retrieve(query: str, k: int = 3) -> list[str]:
+    results = _collection.query(query_texts=[query], n_results=min(k, len(_DOCUMENTS)))
+    return results["documents"][0]
+```
+
+**Embedding model:** `all-MiniLM-L6-v2` (loaded via ONNX by ChromaDB's `DefaultEmbeddingFunction`; no separate model server required).
+
+**Similarity metric:** Cosine distance (HNSW index). Semantic matching means queries like "blood pressure control" correctly retrieve the hypertension management document even without exact keyword overlap.
+
+**Knowledge base contents:**
+
+| # | Topic |
+|---|---|
+| 1 | Hypertension management (first-line agents, DASH diet, BP targets) |
+| 2 | Type 2 Diabetes (Metformin, HbA1c targets, SGLT-2/GLP-1 add-on) |
+| 3 | Chest pain differential (STEMI/NSTEMI, HEART score) |
+| 4 | Drug interactions — anticoagulants (Warfarin + NSAIDs/ciprofloxacin) |
+| 5 | Serotonin syndrome (SSRI/MAOI combinations, management) |
+| 6 | Metformin + contrast media (hold protocol, eGFR threshold) |
+| 7 | Community-acquired pneumonia (CURB-65, antibiotic selection) |
+| 8 | Acute kidney injury (causes, management, dialysis indications) |
+| 9 | Asthma exacerbation (SABA, corticosteroids, intubation criteria) |
+| 10 | Sepsis-3 (hour-1 bundle, vasopressors, lactate threshold) |
+| 11 | Atrial fibrillation (rate vs. rhythm control, CHA₂DS₂-VASc, DOACs) |
+| 12 | Opioid dosing and safety (morphine equivalents, naloxone co-prescribing) |
+
+**Upgrading for production:**
+
+| Use case | Client |
+|---|---|
+| Development / single process | `chromadb.EphemeralClient()` (in-memory, current default) |
+| Persistent local storage | `chromadb.PersistentClient(path="/data/chroma")` |
+| Shared across replicas | `chromadb.HttpClient(host="chroma", port=8000)` (requires a Chroma server container) |
+
+To add new clinical documents, append to `_DOCUMENTS` and redeploy — the collection is rebuilt on startup.
+
+---
 
 ### LangGraph Studio
 

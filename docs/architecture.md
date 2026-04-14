@@ -274,7 +274,7 @@ doctor-portal (or API client)
       │
       │   [routine path]
       │     rag_node
-      │       ├── Retrieve top-3 docs from in-memory KB
+      │       ├── ChromaDB: cosine similarity search, retrieve top-3 docs
       │       └── Ollama: synthesise answer from context
       │     retraining_trigger_node
       │       ├── Check feedback_score < RETRAIN_SCORE_THRESHOLD (0.4)?
