@@ -89,8 +89,10 @@ Paste the output as the value of `FERNET_KEY` in `.env`. Also change `JWT_SECRET
 ### 2. Start the full stack
 
 ```bash
-docker compose up --build
+make start
 ```
+
+This builds images, starts all services in detached mode, and waits for the three API health endpoints to respond before printing the access URLs. Run `make` with no arguments to see all available targets.
 
 Docker Compose handles the complete startup sequence automatically:
 
@@ -102,6 +104,14 @@ Docker Compose handles the complete startup sequence automatically:
 6. **retrain-worker** starts and begins polling for feedback data (depends on postgres, redis, and ollama being healthy)
 
 Model weights are stored in Docker volumes (`ollama_data`, `hf_cache`, `model_artifacts`) and are only downloaded/trained once. The first LoRA training run also downloads the `TinyLlama-1.1B` base model from HuggingFace (~2.2 GB).
+
+**Other useful commands:**
+
+```bash
+make health   # check container status and API health endpoints
+make stop     # stop all services (volumes preserved)
+docker compose down -v  # stop and delete all data volumes
+```
 
 ### 3. Access the apps
 
@@ -306,6 +316,7 @@ See [Security Model](docs/security.md) for the full production hardening checkli
 
 ```
 medical-ai-platform/
+├── Makefile                            # start / stop / health targets
 ├── docker-compose.yml
 ├── .env.example
 ├── alembic.ini
