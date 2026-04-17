@@ -96,7 +96,11 @@ def _parse_llm_json(raw: str) -> dict:
     candidate = json_match.group() if json_match else raw
     # Remove control characters that break JSON parsing
     candidate = re.sub(r"[\x00-\x1f\x7f]", lambda m: " " if m.group() in "\t\n\r" else "", candidate)
-    return json.loads(candidate)
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError as exc:
+        logger.warning("_parse_llm_json: failed to parse JSON (%s)", exc)
+        return {}
 
 
 def _available_ollama_models() -> set[str]:

@@ -31,10 +31,20 @@ _STATIC_CARE_PLAN = {
 
 def _parse_json_response(raw: str) -> dict:
     raw = raw.strip()
-    match = re.search(r"\{.*\}", raw, re.DOTALL)
-    if match:
-        return json.loads(match.group())
-    return json.loads(raw)
+    match = re.search(r"\{.*?\}", raw, re.DOTALL)
+    if not match:
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+    candidate = match.group() if match else raw
+    candidate = re.sub(
+        r"[\x00-\x1f\x7f]",
+        lambda m: " " if m.group() in "\t\n\r" else "",
+        candidate,
+    )
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError as exc:
+        logger.warning("_parse_json_response: failed to parse JSON (%s)", exc)
+        return {}
 
 
 async def generate_care_plan(patient_id: str, visit_notes: str) -> dict:

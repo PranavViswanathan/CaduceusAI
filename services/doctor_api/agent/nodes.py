@@ -56,7 +56,11 @@ def _parse_json_response(raw: str) -> dict:
         lambda m: " " if m.group() in "\t\n\r" else "",
         candidate,
     )
-    return json.loads(candidate)
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError as exc:
+        logger.warning("_parse_json_response: failed to parse JSON (%s)", exc)
+        return {}
 
 
 def _write_audit(
