@@ -7,6 +7,8 @@ class Settings(BaseSettings):
     JWT_SECRET: str
     FERNET_KEY: str
     INTERNAL_API_KEY: str
+    CORS_ORIGINS: str = "http://localhost:3000,http://localhost:3001"
+    COOKIE_DOMAIN: str = "localhost"
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRE_MINUTES: int = 30
 

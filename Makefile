@@ -1,7 +1,7 @@
 SHELL := /usr/bin/env bash
 .SHELLFLAGS := -euo pipefail -c
 
-.PHONY: start stop health help
+.PHONY: start stop health configure help
 
 .DEFAULT_GOAL := help
 
@@ -45,6 +45,40 @@ start: ## Build and start all services, then wait for APIs to be ready
 	echo ""; \
 	echo "Run 'make health' to check service status at any time."; \
 	echo "Run 'make stop' to shut everything down."
+
+configure: ## Interactively set CORS_ORIGINS and COOKIE_DOMAIN in .env (creates .env from .env.example if missing)
+	@if [ ! -f .env ]; then \
+	  cp .env.example .env; \
+	  echo "==> Created .env from .env.example"; \
+	fi
+	@echo ""
+	@echo "==> CORS & Cookie Configuration"
+	@echo "    Leave blank to keep the current value shown in brackets."
+	@echo ""
+	@current_cors=$$(grep -E '^CORS_ORIGINS=' .env | cut -d= -f2-); \
+	printf "  CORS_ORIGINS [$$current_cors]: "; \
+	read new_cors; \
+	if [ -n "$$new_cors" ]; then \
+	  if grep -q '^CORS_ORIGINS=' .env; then \
+	    sed -i.bak "s|^CORS_ORIGINS=.*|CORS_ORIGINS=$$new_cors|" .env && rm -f .env.bak; \
+	  else \
+	    echo "CORS_ORIGINS=$$new_cors" >> .env; \
+	  fi; \
+	  echo "  Updated CORS_ORIGINS=$$new_cors"; \
+	fi
+	@current_domain=$$(grep -E '^COOKIE_DOMAIN=' .env | cut -d= -f2-); \
+	printf "  COOKIE_DOMAIN [$$current_domain]: "; \
+	read new_domain; \
+	if [ -n "$$new_domain" ]; then \
+	  if grep -q '^COOKIE_DOMAIN=' .env; then \
+	    sed -i.bak "s|^COOKIE_DOMAIN=.*|COOKIE_DOMAIN=$$new_domain|" .env && rm -f .env.bak; \
+	  else \
+	    echo "COOKIE_DOMAIN=$$new_domain" >> .env; \
+	  fi; \
+	  echo "  Updated COOKIE_DOMAIN=$$new_domain"; \
+	fi
+	@echo ""
+	@echo "==> Done. Run 'make start' to apply changes."
 
 stop: ## Stop all services (data volumes preserved; use 'docker compose down -v' to remove)
 	@echo "==> Stopping all services..."

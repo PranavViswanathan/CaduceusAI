@@ -40,7 +40,7 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001"],
+    allow_origins=settings.CORS_ORIGINS.split(","),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -100,7 +100,7 @@ def _set_auth_cookie(response: Response, token: str) -> None:
         httponly=True,
         max_age=settings.JWT_EXPIRE_MINUTES * 60,
         path="/",
-        domain="localhost",
+        domain=settings.COOKIE_DOMAIN or None,
         samesite="none",
         secure=True,
     )
@@ -149,7 +149,7 @@ def logout(response: Response):
     response.delete_cookie(
         key="doctor_access_token",
         path="/",
-        domain="localhost",
+        domain=settings.COOKIE_DOMAIN or None,
         samesite="none",
         secure=True,
     )
