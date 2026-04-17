@@ -311,12 +311,13 @@ The pipeline only proceeds once the buffer reaches `MIN_RETRAIN_BATCH` items (de
 | Step | What happens |
 |---|---|
 | **Batch check** | Exits early if `len(buffer) < MIN_RETRAIN_BATCH` |
-| **Dataset construction** | For each buffer item, queries `risk_assessments` and `patient_intake` tables via `assessment_id`. Builds an Alpaca-format `{instruction, input, output}` example. `override` feedback uses the doctor's reason as the corrected `summary`; `flag` feedback appends a clinical note to the original assessment. |
+| **Dataset construction** | For each buffer item, queries `risk_assessments` and `patient_intake` tables via `assessment_id`. Builds an Alpaca-format `{instruction, input, output}` example. `override` feedback uses the doctor's reason as the corrected `summary`; `flag` feedback appends a clinical note to the original assessment. Malformed JSONL lines are skipped with a warning rather than crashing. |
 | **LoRA training** | Loads `TinyLlama/TinyLlama-1.1B-Chat-v1.0` from HuggingFace (cached in `hf_cache` Docker volume). Applies PEFT `LoraConfig(r=8, lora_alpha=16)` targeting `q_proj`, `v_proj`, `k_proj`, `o_proj`. Trains for `LORA_EPOCHS` epochs (default 2) on CPU with `learning_rate=2e-4`. |
 | **Merge** | Calls `peft_model.merge_and_unload()` to fold adapter weights into the base model. Saves the merged model to `/app/models/runs/<version>/merged/`. |
+| **Eval gate** | Runs the merged model against 5 hardcoded clinical scenarios (diabetic + hypertension, Warfarin + NSAID, SSRI + MAOI, Metformin + contrast, healthy patient). Each scenario checks that the model returns valid JSON with `risks` (list), `confidence` (low/medium/high), and `summary` (non-empty string). **The model is promoted only if all 5 scenarios pass (pass rate = 100%).** If the gate fails, the run is logged with `"status": "eval_failed"` and the buffer is preserved for retry. |
 | **GGUF conversion** | Runs `llama.cpp`'s `convert_hf_to_gguf.py` on the merged model to produce a quantized `model.gguf` (q8_0). Skipped gracefully if `llama.cpp` is not available. |
-| **Ollama registration** | Calls `POST /api/create` on Ollama with a Modelfile pointing to the GGUF. Tags the result as both `medical-risk-ft:<version>` and `medical-risk-ft:latest`. |
-| **Model registry** | Appends a run record to `/app/models/registry.json` with version, paths, metrics, and status. |
+| **Ollama registration** | Calls `POST /api/create` on Ollama with a Modelfile pointing to the GGUF. Tags the result as both `medical-risk-ft:<version>` and `medical-risk-ft:latest`. Updates `active_model` in Redis to `medical-risk-ft:latest` so the API can read the current model name without an Ollama tag lookup. |
+| **Model registry** | Appends a run record to `/app/models/registry.json` with version, paths, eval pass rate, action breakdown, override rate, and status (`success` / `eval_failed` / `failed`). |
 | **Buffer clear** | Clears `retrain_buffer.jsonl` only on success. On failure the buffer is preserved for retry and the error is logged. |
 
 #### LoRA configuration
@@ -365,6 +366,9 @@ Response:
       "status": "success",
       "items_used": 7,
       "examples_built": 7,
+      "eval_pass_rate": 1.0,
+      "action_breakdown": {"override": 5, "flag": 2},
+      "override_rate": 0.7143,
       "ollama_model": "medical-risk-ft:20260410T120000Z",
       "base_model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
       "epochs": 2

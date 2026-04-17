@@ -39,7 +39,7 @@ Session JWTs are stored in **httpOnly cookies**, never in JavaScript-accessible 
 | `HttpOnly` | true | true | JavaScript cannot read the token (XSS protection) |
 | `SameSite` | None | Strict | `None` required on localhost for cross-port sends; tighten to `Strict` once all services share one domain |
 | `Secure` | true | true | Chrome requires `Secure` when `SameSite=None`; localhost is a secure context |
-| `Domain` | localhost | your domain (e.g. `api.example.com`) | Update for production so the cookie scope matches the ALB domain |
+| `Domain` | `COOKIE_DOMAIN` (default: `localhost`) | Set `COOKIE_DOMAIN` to your domain (e.g. `api.example.com`) or blank for request-host resolution | Controls which domain receives the cookie; set via `make configure` before deploying |
 
 ---
 
@@ -141,10 +141,16 @@ Plaintext passwords are never stored, logged, or returned in any API response.
 
 ## CORS Policy
 
-Both APIs restrict cross-origin requests to the two frontend origins:
+All APIs restrict cross-origin requests to the origins listed in the `CORS_ORIGINS` environment variable (comma-separated). The default value in `.env.example` is:
+
+```
+CORS_ORIGINS=http://localhost:3000,http://localhost:3001
+```
+
+This maps to:
 
 ```python
-allow_origins=["http://localhost:3000", "http://localhost:3001"]
+allow_origins=settings.CORS_ORIGINS.split(",")
 allow_methods=["*"]
 allow_headers=["*"]
 allow_credentials=True
@@ -152,7 +158,7 @@ allow_credentials=True
 
 `allow_credentials=True` is required for browsers to send the httpOnly session cookies on cross-origin requests.
 
-**In production**: replace `localhost` origins with the actual domain names (e.g., `https://example.com` and `https://doctor.example.com`).
+**In production**: set `CORS_ORIGINS` to the actual frontend URLs (e.g., `https://example.com,https://doctor.example.com`). Use `make configure` to update the value interactively.
 
 ---
 

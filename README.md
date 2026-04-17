@@ -86,6 +86,14 @@ python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().
 
 Paste the output as the value of `FERNET_KEY` in `.env`. Also change `JWT_SECRET` and `INTERNAL_API_KEY` to strong random values.
 
+To set or update `CORS_ORIGINS` and `COOKIE_DOMAIN` interactively:
+
+```bash
+make configure
+```
+
+This creates `.env` from `.env.example` if it does not exist, then prompts for the two values (blank input keeps the current value). Run before `make start` when deploying to a custom domain.
+
 ### 2. Start the full stack
 
 ```bash
@@ -305,7 +313,8 @@ The `ollama/ollama` image does not include `curl`. The healthcheck uses `ollama 
 - Inter-service calls require `X-Internal-Key` header
 - Rate limiting is active on all auth endpoints (5 requests/minute per IP; 1000/minute in test mode)
 - Audit log records every write operation (actor, action, outcome) without logging PHI values
-- CORS is locked to `localhost:3000` and `localhost:3001` (update to real domains for production)
+- CORS allowed origins are configured via `CORS_ORIGINS` in `.env` (comma-separated list; defaults to `http://localhost:3000,http://localhost:3001`). Use `make configure` to update interactively.
+- Cookie domain is controlled by `COOKIE_DOMAIN` in `.env` (defaults to `localhost`; set to your domain or leave blank for production)
 - In AWS: secrets live in Secrets Manager, DB is encrypted at rest (RDS), Redis is encrypted at rest (ElastiCache), Ollama is private (no public IP)
 
 See [Security Model](docs/security.md) for the full production hardening checklist.

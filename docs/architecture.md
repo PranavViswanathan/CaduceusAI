@@ -317,14 +317,16 @@ retrain-worker  (polls every RETRAIN_POLL_INTERVAL_SECONDS, default 5 min)
   → scripts/retrain_loop.py
       ├── Check len(buffer) >= MIN_RETRAIN_BATCH (default 5)
       ├── Query risk_assessments + patient_intake for each assessment_id
-      ├── Build Alpaca {instruction, input, output} examples
+      ├── Build Alpaca {instruction, input, output} examples (malformed lines skipped)
       ├── PEFT LoRA fine-tune TinyLlama-1.1B (CPU, 2 epochs)
       ├── Merge adapter → save HuggingFace model
+      ├── Eval gate: run 5 clinical scenarios; abort promotion if any fail
       ├── Convert to GGUF via llama.cpp (convert_hf_to_gguf.py)
       ├── POST /api/create on Ollama  → medical-risk-ft:latest
+      ├── SET active_model=medical-risk-ft:latest in Redis
       ├── Write run record to data/retrain_log.jsonl
       ├── Append to /app/models/registry.json
-      └── Clear buffer (only on success)
+      └── Clear buffer (only on success; eval_failed preserves buffer for retry)
 
 doctor-api  (on next risk assessment request)
   → llm.get_risk_assessment()
@@ -522,7 +524,7 @@ In AWS, internal endpoints should additionally be isolated at the security group
 
 ## Cookie-Based Authentication
 
-Login endpoints set an httpOnly cookie scoped to `domain=localhost` in development (no port). In production, update the `Domain` attribute to match your actual domain.
+Login endpoints set an httpOnly cookie whose `Domain` attribute is controlled by the `COOKIE_DOMAIN` environment variable (default: `localhost`). In production, set `COOKIE_DOMAIN` to your actual domain (e.g. `api.example.com`) or leave it blank to let FastAPI resolve it to the request host. Use `make configure` to update this interactively before deploying.
 
 | Cookie name | Set by | Read by |
 |---|---|---|
@@ -555,6 +557,8 @@ In production (behind the ALB), all three API services share the same domain and
 | `LORA_ALPHA` | retrain-worker | LoRA alpha. Default: `16` |
 | `LORA_EPOCHS` | retrain-worker | Training epochs. Default: `2` |
 | `LORA_LR` | retrain-worker | Learning rate. Default: `2e-4` |
+| `CORS_ORIGINS` | all APIs | Comma-separated list of allowed CORS origins. Default: `http://localhost:3000,http://localhost:3001`. Set to real frontend URLs in production. |
+| `COOKIE_DOMAIN` | all APIs | `Domain` attribute for session cookies. Default: `localhost`. Set to your domain (e.g. `api.example.com`) or leave blank in production to resolve to the request host. |
 | `NEXT_PUBLIC_PATIENT_API_URL` | patient-portal | Browser-visible patient API base URL |
 | `NEXT_PUBLIC_DOCTOR_API_URL` | doctor-portal | Browser-visible doctor API base URL |
 | `NEXT_PUBLIC_POSTCARE_API_URL` | both portals | Browser-visible postcare API base URL |
@@ -570,6 +574,7 @@ In AWS, all secret values (`JWT_SECRET`, `FERNET_KEY`, `INTERNAL_API_KEY`, `DATA
 | Ollama timeout / unavailable | Rule-based fallback (120 s timeout); response has `source: "rule_based"`, confidence `"low"` |
 | Fine-tuned model not yet available | `llm.py` falls back to `llama3` → `mistral` → rule-based automatically |
 | LoRA training failure | Buffer is preserved for retry; failure written to `retrain_log.jsonl` with `"status": "failed"` |
+| LoRA eval gate failure | Merged model did not pass all 5 clinical eval scenarios; Ollama registration skipped; buffer preserved for retry; logged with `"status": "eval_failed"` and `eval_pass_rate` |
 | GGUF conversion unavailable | Adapter and merged model saved in HuggingFace format; Ollama registration skipped; inference continues with base models |
 | PostgreSQL down | HTTP 503, no stack traces in response body |
 | Redis down | Cache miss treated as no-op; queue pushes fail silently with a log warning |
