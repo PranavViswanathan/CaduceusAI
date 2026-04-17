@@ -16,6 +16,7 @@ Steps:
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -28,6 +29,7 @@ from sqlalchemy import create_engine, text
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
+REDIS_URL = os.getenv("REDIS_URL", "")
 RETRAIN_BUFFER_PATH = Path(os.getenv("RETRAIN_BUFFER_PATH", "/app/data/retrain_buffer.jsonl"))
 RETRAIN_LOG_PATH = Path(os.getenv("RETRAIN_LOG_PATH", "/app/data/retrain_log.jsonl"))
 MODELS_DIR = Path(os.getenv("MODELS_DIR", "/app/models"))
@@ -41,6 +43,54 @@ LORA_RANK = int(os.getenv("LORA_RANK", "8"))
 LORA_ALPHA = int(os.getenv("LORA_ALPHA", "16"))
 LORA_EPOCHS = int(os.getenv("LORA_EPOCHS", "2"))
 LORA_LR = float(os.getenv("LORA_LR", "2e-4"))
+
+_EVAL_SCENARIOS = [
+    {
+        "description": "diabetic with hypertension on metformin",
+        "patient": {
+            "conditions": ["Type 2 diabetes", "hypertension"],
+            "medications": [{"name": "metformin"}, {"name": "lisinopril"}],
+            "allergies": ["penicillin"],
+            "symptoms": "fatigue and frequent urination",
+        },
+    },
+    {
+        "description": "warfarin + NSAID interaction",
+        "patient": {
+            "conditions": ["atrial fibrillation"],
+            "medications": [{"name": "warfarin"}, {"name": "ibuprofen"}],
+            "allergies": [],
+            "symptoms": "palpitations",
+        },
+    },
+    {
+        "description": "SSRI + MAOI combination",
+        "patient": {
+            "conditions": ["major depressive disorder"],
+            "medications": [{"name": "sertraline"}, {"name": "phenelzine"}],
+            "allergies": [],
+            "symptoms": "mood changes, insomnia",
+        },
+    },
+    {
+        "description": "metformin before contrast procedure",
+        "patient": {
+            "conditions": ["coronary artery disease", "Type 2 diabetes"],
+            "medications": [{"name": "metformin"}, {"name": "aspirin"}],
+            "allergies": [],
+            "symptoms": "chest tightness, scheduled for CT angiogram with contrast dye",
+        },
+    },
+    {
+        "description": "healthy patient, no interactions",
+        "patient": {
+            "conditions": [],
+            "medications": [{"name": "vitamin D"}],
+            "allergies": [],
+            "symptoms": "annual checkup",
+        },
+    },
+]
 
 _db_engine = None
 
@@ -389,6 +439,78 @@ def write_model_registry(metadata: dict) -> None:
     registry_path.write_text(json.dumps(registry, indent=2))
 
 
+def evaluate_candidate_model(merged_dir: Path) -> float:
+    """Run the merged model against the hardcoded eval set. Returns pass rate (0.0–1.0)."""
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline as hf_pipeline
+
+    logger.info("Evaluating candidate model (%d scenarios)...", len(_EVAL_SCENARIOS))
+    tokenizer = AutoTokenizer.from_pretrained(str(merged_dir))
+    model = AutoModelForCausalLM.from_pretrained(
+        str(merged_dir), torch_dtype=torch.float32, low_cpu_mem_usage=True
+    )
+    pipe = hf_pipeline(
+        "text-generation", model=model, tokenizer=tokenizer,
+        max_new_tokens=256, do_sample=False,
+    )
+
+    passed = 0
+    for scenario in _EVAL_SCENARIOS:
+        patient = scenario["patient"]
+        conditions = ", ".join(patient.get("conditions", [])) or "None"
+        medications = "; ".join(
+            m.get("name", str(m)) if isinstance(m, dict) else str(m)
+            for m in patient.get("medications", [])
+        ) or "None"
+        allergies = ", ".join(patient.get("allergies", [])) or "None"
+        symptoms = patient.get("symptoms") or "None"
+        prompt = (
+            "You are a clinical risk assessment tool. Reply with ONLY a JSON object — no prose, no markdown.\n"
+            'Required format: {"risks":["short risk 1"],"confidence":"low","summary":"one sentence"}\n'
+            "confidence must be exactly: low, medium, or high.\n\n"
+            f"Conditions: {conditions}\nMedications: {medications}\n"
+            f"Allergies: {allergies}\nSymptoms: {symptoms}\n\nJSON:"
+        )
+        try:
+            full_output: str = pipe(prompt)[0]["generated_text"]
+            response_part = full_output[len(prompt):] if full_output.startswith(prompt) else full_output
+            json_match = re.search(r"\{.*?\}", response_part, re.DOTALL) or re.search(r"\{.*\}", response_part, re.DOTALL)
+            if not json_match:
+                logger.warning("Eval '%s': no JSON in response", scenario["description"])
+                continue
+            parsed = json.loads(json_match.group())
+            if not isinstance(parsed.get("risks"), list):
+                logger.warning("Eval '%s': 'risks' is not a list", scenario["description"])
+                continue
+            if parsed.get("confidence") not in ("low", "medium", "high"):
+                logger.warning("Eval '%s': invalid confidence '%s'", scenario["description"], parsed.get("confidence"))
+                continue
+            if not isinstance(parsed.get("summary"), str) or not parsed["summary"].strip():
+                logger.warning("Eval '%s': 'summary' missing or empty", scenario["description"])
+                continue
+            passed += 1
+            logger.info("Eval '%s': PASS", scenario["description"])
+        except Exception as exc:
+            logger.warning("Eval '%s' error: %s", scenario["description"], exc)
+
+    pass_rate = passed / len(_EVAL_SCENARIOS)
+    logger.info("Eval complete: %d/%d passed (%.0f%%)", passed, len(_EVAL_SCENARIOS), pass_rate * 100)
+    return pass_rate
+
+
+def _set_active_model_redis(model_name: str) -> None:
+    if not REDIS_URL:
+        logger.warning("REDIS_URL not set — skipping active_model update")
+        return
+    try:
+        import redis as redis_lib
+        r = redis_lib.from_url(REDIS_URL, decode_responses=True, socket_connect_timeout=2)
+        r.set("active_model", model_name)
+        logger.info("Redis active_model set to: %s", model_name)
+    except Exception as exc:
+        logger.warning("Failed to update Redis active_model: %s", exc)
+
+
 def process_buffer() -> int:
     items = load_buffer(RETRAIN_BUFFER_PATH)
 
@@ -421,12 +543,15 @@ def process_buffer() -> int:
         a = item.get("action", "unknown")
         action_counts[a] = action_counts.get(a, 0) + 1
 
+    override_rate = action_counts.get("override", 0) / len(items)
+
     metadata: dict = {
         "version": run_timestamp,
         "trained_at": datetime.now(timezone.utc).isoformat(),
         "items_used": len(items),
         "examples_built": len(examples),
         "action_breakdown": action_counts,
+        "override_rate": round(override_rate, 4),
         "base_model": BASE_MODEL_NAME,
         "lora_rank": LORA_RANK,
         "lora_alpha": LORA_ALPHA,
@@ -441,6 +566,19 @@ def process_buffer() -> int:
         merged_dir = merge_and_save(adapter_dir, run_dir)
         metadata["merged_path"] = str(merged_dir)
 
+        eval_pass_rate = evaluate_candidate_model(merged_dir)
+        metadata["eval_pass_rate"] = round(eval_pass_rate, 4)
+
+        if eval_pass_rate < 1.0:
+            logger.warning(
+                "Eval gate failed (pass_rate=%.0f%%) — aborting promotion. Buffer preserved for retry.",
+                eval_pass_rate * 100,
+            )
+            metadata["status"] = "eval_failed"
+            append_log(RETRAIN_LOG_PATH, metadata)
+            write_model_registry(metadata)
+            return -1
+
         gguf_path = convert_to_gguf(merged_dir, run_dir)
         metadata["gguf_path"] = str(gguf_path) if gguf_path else None
 
@@ -448,6 +586,10 @@ def process_buffer() -> int:
         if gguf_path:
             ollama_model = register_with_ollama(gguf_path, run_timestamp)
         metadata["ollama_model"] = ollama_model
+
+        if ollama_model:
+            latest_name = f"{FINE_TUNED_MODEL_NAME}:latest"
+            _set_active_model_redis(latest_name)
 
         metadata["status"] = "success"
         logger.info("Retraining complete. Version: %s", run_timestamp)

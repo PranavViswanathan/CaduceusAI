@@ -3,13 +3,14 @@
 import { useState, useEffect, useRef } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
-import { getPatients, getPendingEscalations, PatientListItem, Escalation } from '@/lib/api'
+import { getPatients, getPendingEscalations, getRetrainStatus, PatientListItem, Escalation, RetrainStatus } from '@/lib/api'
 import { getDoctorId, logout } from '@/lib/auth'
 
 export default function PatientsPage() {
   const router = useRouter()
   const [patients, setPatients] = useState<PatientListItem[]>([])
   const [escalations, setEscalations] = useState<Escalation[]>([])
+  const [retrainStatus, setRetrainStatus] = useState<RetrainStatus | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -26,8 +27,8 @@ export default function PatientsPage() {
   useEffect(() => {
     if (!getDoctorId()) { router.replace('/login'); return }
 
-    Promise.all([getPatients(), getPendingEscalations()])
-      .then(([p, e]) => { setPatients(p); setEscalations(e) })
+    Promise.all([getPatients(), getPendingEscalations(), getRetrainStatus()])
+      .then(([p, e, r]) => { setPatients(p); setEscalations(e); setRetrainStatus(r) })
       .catch(err => setError(err instanceof Error ? err.message : 'Failed to load'))
       .finally(() => setLoading(false))
 
@@ -80,6 +81,39 @@ export default function PatientsPage() {
                 {escalations.map(e => e.patient_name).join(', ')}
               </p>
             </div>
+          </div>
+        )}
+
+        {/* Retrain queue status bar */}
+        {retrainStatus && (
+          <div className="mb-6 flex flex-wrap items-center gap-4 px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-sm">
+            <div className="flex items-center gap-1.5">
+              <span className="text-slate-500">Retrain queue:</span>
+              <span className="font-semibold text-slate-800">{retrainStatus.queued_count}</span>
+              <span className="text-slate-400">/ {retrainStatus.min_batch} needed</span>
+            </div>
+            {retrainStatus.items_needed > 0 ? (
+              <span className="px-2 py-0.5 bg-amber-100 text-amber-700 rounded-full text-xs font-medium">
+                {retrainStatus.items_needed} more override{retrainStatus.items_needed !== 1 ? 's' : ''} to trigger retrain
+              </span>
+            ) : (
+              <span className="px-2 py-0.5 bg-green-100 text-green-700 rounded-full text-xs font-medium">
+                Ready to retrain
+              </span>
+            )}
+            {retrainStatus.last_run && (
+              <div className="flex items-center gap-2 ml-auto text-xs text-slate-500">
+                <span>Last run: <span className="font-mono text-slate-700">{retrainStatus.last_run.version}</span></span>
+                <span className={`px-1.5 py-0.5 rounded-full font-medium ${
+                  retrainStatus.last_run.status === 'success' ? 'bg-green-100 text-green-700' :
+                  retrainStatus.last_run.status === 'eval_failed' ? 'bg-yellow-100 text-yellow-700' :
+                  'bg-red-100 text-red-700'
+                }`}>{retrainStatus.last_run.status}</span>
+                {retrainStatus.last_run.override_rate !== undefined && (
+                  <span>Override rate: <span className="font-medium text-slate-700">{(retrainStatus.last_run.override_rate * 100).toFixed(0)}%</span></span>
+                )}
+              </div>
+            )}
           </div>
         )}
 

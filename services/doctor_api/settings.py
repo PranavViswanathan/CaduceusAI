@@ -8,6 +8,7 @@ class Settings(BaseSettings):
     FERNET_KEY: str
     INTERNAL_API_KEY: str
     OLLAMA_URL: str
+    OLLAMA_MODEL: str = "llama3"
     FINE_TUNED_MODEL_NAME: str = "medical-risk-ft"
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRE_MINUTES: int = 30

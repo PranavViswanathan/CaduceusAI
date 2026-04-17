@@ -34,6 +34,22 @@ export type Escalation = {
   created_at: string
 }
 
+export type RetrainRunSummary = {
+  version: string
+  trained_at: string
+  status: string
+  override_rate?: number
+  eval_pass_rate?: number
+  items_used: number
+}
+
+export type RetrainStatus = {
+  queued_count: number
+  min_batch: number
+  items_needed: number
+  last_run: RetrainRunSummary | null
+}
+
 export type PatientDetail = {
   id: string
   name: string
@@ -97,6 +113,13 @@ export async function submitFeedback(patientId: string, feedback: FeedbackPayloa
 
 export async function getPendingEscalations(): Promise<Escalation[]> {
   const res = await fetch(`${DOCTOR_API}/v1/escalations/pending`, {
+    credentials: 'include',
+  })
+  return handleResponse(res)
+}
+
+export async function getRetrainStatus(): Promise<RetrainStatus> {
+  const res = await fetch(`${DOCTOR_API}/v1/doctor/retrain/status`, {
     credentials: 'include',
   })
   return handleResponse(res)

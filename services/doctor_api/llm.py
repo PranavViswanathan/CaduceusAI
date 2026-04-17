@@ -3,6 +3,7 @@ import logging
 import re
 
 import httpx
+import redis as redis_lib
 
 from settings import settings
 
@@ -107,11 +108,36 @@ def _available_ollama_models() -> set[str]:
         return set()
 
 
+def _get_active_model() -> str:
+    try:
+        r = redis_lib.from_url(settings.REDIS_URL, decode_responses=True, socket_connect_timeout=2)
+        r.ping()
+        active = r.get("active_model")
+        if active:
+            return active
+    except Exception:
+        pass
+    return settings.OLLAMA_MODEL
+
+
 def _model_priority_list() -> list[str]:
     available = _available_ollama_models()
+    active = _get_active_model()
     ft_name = settings.FINE_TUNED_MODEL_NAME
-    candidates = [ft_name, "llama3", "mistral"]
-    return [m for m in candidates if m in available] or ["llama3", "mistral"]
+    candidates = [active, ft_name, "llama3", "mistral"]
+
+    seen: set[str] = set()
+    unique: list[str] = []
+    for c in candidates:
+        if c not in seen:
+            seen.add(c)
+            unique.append(c)
+
+    # Match by base name so tagged names like "medical-risk-ft:latest" resolve correctly
+    def is_available(model: str) -> bool:
+        return model.split(":")[0] in available
+
+    return [m for m in unique if is_available(m)] or [active, "llama3", "mistral"]
 
 
 async def get_risk_assessment(patient_data: dict) -> dict:

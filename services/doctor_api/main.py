@@ -319,7 +319,6 @@ def submit_feedback(
 
 @router.get("/doctor/retrain/status")
 def retrain_status(current_doctor: Doctor = Depends(get_current_doctor)):
-    """Return recent training run history from the model registry."""
     registry_path = Path("/app/models/registry.json")
     runs: list[dict] = []
     if registry_path.exists():
@@ -328,18 +327,35 @@ def retrain_status(current_doctor: Doctor = Depends(get_current_doctor)):
         except Exception:
             runs = []
 
-    buffer_items = 0
+    queued_count = 0
     if RETRAIN_BUFFER.exists():
         try:
-            buffer_items = sum(1 for line in RETRAIN_BUFFER.read_text().splitlines() if line.strip())
+            queued_count = sum(1 for line in RETRAIN_BUFFER.read_text().splitlines() if line.strip())
         except Exception:
             pass
 
+    min_batch = int(os.getenv("MIN_RETRAIN_BATCH", "5"))
     return {
-        "buffer_items_pending": buffer_items,
-        "total_runs": len(runs),
-        "runs": runs[-10:],  # last 10 runs
+        "queued_count": queued_count,
+        "min_batch": min_batch,
+        "items_needed": max(0, min_batch - queued_count),
+        "last_run": runs[-1] if runs else None,
     }
+
+
+@router.get("/doctor/retrain/history")
+def retrain_history(x_internal_key: Annotated[str | None, Header()] = None):
+    if x_internal_key != settings.INTERNAL_API_KEY:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    registry_path = Path("/app/models/registry.json")
+    runs: list[dict] = []
+    if registry_path.exists():
+        try:
+            runs = json.loads(registry_path.read_text())
+        except Exception:
+            runs = []
+    return runs
 
 
 @router.post("/doctor/retrain/trigger")
