@@ -87,8 +87,9 @@ def _write_audit(
         )
         db.add(entry)
         db.commit()
-    except Exception:
+    except Exception as exc:
         db.rollback()
+        logger.error("CRITICAL: audit log write failed (route=%s action=%s): %s", route, action, exc)
 
 
 # ── Node 1: triage_node ───────────────────────────────────────────────────────

@@ -61,8 +61,9 @@ def _write_audit(db: Session, route: str, action: str, outcome: str, actor_id=No
         entry = AuditLog(service="postcare_api", route=route, actor_id=actor_id, patient_id=patient_id, action=action, outcome=outcome, ip_address=ip)
         db.add(entry)
         db.commit()
-    except Exception:
+    except Exception as exc:
         db.rollback()
+        logger.error("CRITICAL: audit log write failed (route=%s action=%s): %s", route, action, exc)
 
 
 def _require_internal_key(x_internal_key: Annotated[str | None, Header()] = None):

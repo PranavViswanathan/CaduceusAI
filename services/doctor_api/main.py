@@ -94,8 +94,9 @@ def _write_audit(db: Session, route: str, action: str, outcome: str, actor_id=No
         entry = AuditLog(service="doctor_api", route=route, actor_id=actor_id, patient_id=patient_id, action=action, outcome=outcome, ip_address=ip)
         db.add(entry)
         db.commit()
-    except Exception:
+    except Exception as exc:
         db.rollback()
+        logger.error("CRITICAL: audit log write failed (route=%s action=%s): %s", route, action, exc)
 
 
 def _set_auth_cookie(response: Response, token: str) -> None:
@@ -284,7 +285,7 @@ def submit_feedback(
     try:
         fb = Feedback(
             patient_id=patient_id,
-            doctor_id=body.doctor_id,
+            doctor_id=current_doctor.id,
             action=body.action,
             reason=body.reason,
             assessment_id=body.assessment_id if body.assessment_id else None,
