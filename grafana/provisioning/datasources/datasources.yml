@@ -2,6 +2,7 @@ apiVersion: 1
 
 datasources:
   - name: Prometheus
+    uid: Prometheus
     type: prometheus
     access: proxy
     url: http://prometheus:9090
@@ -10,9 +11,7 @@ datasources:
       timeInterval: 15s
 
   - name: Jaeger
+    uid: Jaeger
     type: jaeger
     access: proxy
     url: http://jaeger:16686
-    jsonData:
-      tracesToLogsV2:
-        datasourceUid: ''

@@ -115,6 +115,9 @@ def get_care_plan(
     user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    if user.get("role") != "doctor" and user.get("sub") != patient_id:
+        raise HTTPException(status_code=403, detail="Access denied")
+
     try:
         plan = (
             db.query(CarePlan)
@@ -140,6 +143,9 @@ async def checkin(
     user: dict = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+    if user.get("role") != "doctor" and user.get("sub") != str(body.patient_id):
+        raise HTTPException(status_code=403, detail="Access denied")
+
     latest_plan = (
         db.query(CarePlan)
         .filter(CarePlan.patient_id == body.patient_id)
