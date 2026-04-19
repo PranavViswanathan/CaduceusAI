@@ -16,16 +16,23 @@ os.environ["TESTING"] = "true"
 # Add service root to sys.path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import uuid as _uuid_mod
+
 import pytest
 from fastapi.testclient import TestClient
 from jose import jwt
 from datetime import datetime, timedelta
 
+# Fixed UUIDs so tests can reference them without going through the JWT payload
+TEST_PATIENT_ID = str(_uuid_mod.uuid4())
+TEST_DOCTOR_ID = str(_uuid_mod.uuid4())
+
 
 def _make_token(role: str = "patient") -> str:
     from settings import settings
+    sub = TEST_PATIENT_ID if role == "patient" else TEST_DOCTOR_ID
     payload = {
-        "sub": "test-user-id",
+        "sub": sub,
         "role": role,
         "exp": datetime.utcnow() + timedelta(minutes=30),
     }

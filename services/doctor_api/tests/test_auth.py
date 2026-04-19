@@ -56,7 +56,8 @@ def test_login_success(client, mock_db, sample_doctor):
     body = resp.json()
     assert "doctor_id" in body
     assert body["token_type"] == "cookie"
-    assert "doctor_access_token" in resp.cookies
+    # TestClient (httpx) drops Secure cookies on HTTP; check the raw header instead
+    assert "doctor_access_token" in resp.headers.get("set-cookie", "")
 
 
 def test_login_wrong_credentials(client, mock_db):
