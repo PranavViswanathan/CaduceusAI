@@ -167,17 +167,46 @@ allow_credentials=True
 | Endpoint | Allowed |
 |---|---|
 | `GET /v1/patients/{id}` | Only the authenticated patient with matching `id` |
-| `GET /v1/doctor/patients` | Any authenticated doctor |
-| `GET /v1/doctor/patients/{id}/risk` | Any authenticated doctor |
-| `POST /v1/doctor/patients/{id}/feedback` | Any authenticated doctor |
-| `GET /v1/escalations/pending` | Any authenticated doctor |
+| `GET /v1/doctor/patients` | Any authenticated doctor — **returns only assigned patients** |
+| `POST /v1/doctor/patients/{id}/assign` | Any authenticated doctor |
+| `DELETE /v1/doctor/patients/{id}/assign` | The authenticated doctor who owns the assignment |
+| `GET /v1/doctor/patients/{id}/risk` | Authenticated doctor **assigned to this patient** — HTTP 403 otherwise |
+| `POST /v1/doctor/patients/{id}/feedback` | Authenticated doctor **assigned to this patient** — HTTP 403 otherwise |
+| `GET /v1/escalations/pending` (doctor-api) | Any authenticated doctor — **returns only escalations for assigned patients** |
 | `POST /v1/escalations/{id}/acknowledge` | Any authenticated doctor |
 | `POST /v1/agent/query` | Any authenticated doctor |
 | `GET /v1/agent/graph` | Any authenticated doctor |
+| `GET /v1/careplan/{patient_id}` | Authenticated doctor (any), or the patient matching `patient_id` — HTTP 403 otherwise |
+| `POST /v1/followup/checkin` | Authenticated doctor (any), or the patient matching `body.patient_id` — HTTP 403 otherwise |
+| `GET /v1/escalations/pending` (postcare-api) | Any authenticated doctor |
+| `POST /v1/escalations/{id}/acknowledge` | Any authenticated doctor |
 | `POST /v1/careplan/generate` | Internal key only |
 | `POST /v1/doctor/retrain/trigger` | Internal key only |
 
-Patients cannot access any `doctor-api` or `postcare-api` doctor routes. There is no admin role; doctor access is flat (any doctor can view any patient).
+Patients cannot access any `doctor-api` doctor routes.
+
+---
+
+## Row-Level Security (Doctor–Patient Assignments)
+
+Doctor access to patient data in `doctor-api` is governed by the `doctor_patient_assignments` table. This is a many-to-many join between `doctors` and `patients` with a unique constraint on `(doctor_id, patient_id)`.
+
+**What is gated:**
+
+- `GET /v1/doctor/patients` — JOINs the assignment table; a doctor only sees patients they are assigned to.
+- `GET /v1/doctor/patients/{id}/risk` — calls `_assert_assigned()` before any DB or Redis access.
+- `POST /v1/doctor/patients/{id}/feedback` — calls `_assert_assigned()` at handler entry.
+- `GET /v1/escalations/pending` — filters by a subquery on the doctor's assigned patient IDs.
+
+**`_assert_assigned(doctor_id, patient_id, db)`** — a single internal helper that queries `doctor_patient_assignments` and raises HTTP 403 `"Not assigned to this patient"` if no row is found. This keeps enforcement logic in one place.
+
+**Assignment lifecycle:**
+
+1. A doctor calls `POST /v1/doctor/patients/{patient_id}/assign` to link themselves to a patient. The endpoint is idempotent — if the assignment already exists, it returns the existing record with HTTP 201.
+2. A doctor calls `DELETE /v1/doctor/patients/{patient_id}/assign` to remove their assignment. Returns HTTP 404 if no assignment exists.
+3. All assignment events are written to `audit_log` with action `patient_assigned` or `patient_unassigned`.
+
+**Audit integrity:** The feedback retrain queue payload always uses `current_doctor.id` from the authenticated JWT — the `FeedbackCreate` request body no longer contains a `doctor_id` field, eliminating the possibility of a caller spoofing authorship.
 
 ---
 

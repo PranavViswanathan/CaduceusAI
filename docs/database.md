@@ -223,6 +223,24 @@ Created by `escalation_node` in the LangGraph agent when a query is classified a
 
 ---
 
+### `doctor_patient_assignments`
+
+Many-to-many assignment table that enforces row-level security in `doctor-api`. A doctor can only view, assess, or submit feedback for patients they are assigned to. An admin or onboarding workflow creates rows here before a doctor accesses a patient record.
+
+| Column | Type | Constraints | Notes |
+|---|---|---|---|
+| `id` | UUID | PK, default `uuid_generate_v4()` | |
+| `doctor_id` | UUID | FK `doctors.id`, NOT NULL | |
+| `patient_id` | UUID | FK `patients.id`, NOT NULL | |
+| `assigned_at` | DateTime | default `now()` | |
+| `assigned_by` | UUID | nullable | UUID of the actor who created the assignment (defaults to the doctor themselves) |
+
+**Constraints**: `UNIQUE(doctor_id, patient_id)` — duplicate assignments are prevented at the DB level. A re-assignment request returns the existing row (idempotent API).
+
+**Indexes**: `ix_dpa_doctor_id` on `doctor_id`; `ix_dpa_patient_id` on `patient_id`.
+
+---
+
 ### `audit_log`
 
 Append-only log of all write operations. PHI values are never written here — only actor IDs, patient IDs, and action descriptions.
@@ -252,6 +270,7 @@ patients ──< feedback          >── doctors
 patients ──< care_plans
 patients ──< followup_checkins ──< escalations
 patients ──< agent_escalations >── doctors   (via patient_id / actor_id; both nullable)
+patients >──< doctors  (via doctor_patient_assignments — enforces row-level security)
 ```
 
 ---
@@ -279,6 +298,10 @@ CREATE INDEX ON audit_log (patient_id, timestamp DESC);
 -- Agent escalation queries (unacknowledged, by patient)
 CREATE INDEX ON agent_escalations (acknowledged, created_at DESC);
 CREATE INDEX ON agent_escalations (patient_id, created_at DESC);
+
+-- Doctor-patient assignment lookups (created by ORM; listed here for reference)
+CREATE INDEX ix_dpa_doctor_id ON doctor_patient_assignments (doctor_id);
+CREATE INDEX ix_dpa_patient_id ON doctor_patient_assignments (patient_id);
 ```
 
 ---

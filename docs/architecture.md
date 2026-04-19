@@ -160,8 +160,11 @@ medical-ai-platform/
 │   ├── doctor_api/                 # Tier 2 backend  (port 8002)
 │   │   ├── telemetry.py            # OTel SDK init
 │   │   ├── llm.py                  # Manual spans: ollama.risk_assessment; custom metrics
+│   │   ├── audit.py                # Shared write_audit() helper (used by main.py + agent/nodes.py)
+│   │   ├── encryption.py           # encrypt() + decrypt() via Fernet
 │   │   └── agent/                  # LangGraph orchestration layer
-│   │       └── nodes.py            # Per-node spans: agent.{triage,rag,reasoning,...}
+│   │       ├── nodes.py            # Per-node spans: agent.{triage,rag,reasoning,...}
+│   │       └── knowledge_base.py   # ChromaDB client (configurable via CHROMA_CLIENT_TYPE)
 │   └── postcare_api/               # Tier 3 backend  (port 8003)
 │       ├── telemetry.py            # OTel SDK init
 │       └── llm.py                  # Manual spans: ollama.care_plan, ollama.urgency_assessment
@@ -199,7 +202,7 @@ medical-ai-platform/
 | Service | Port | Owns |
 |---|---|---|
 | `patient-api` | 8001 | Patient auth, intake storage, encrypted PHI |
-| `doctor-api` | 8002 | Doctor auth, LLM risk assessment, feedback, retrain queue, LangGraph agent |
+| `doctor-api` | 8002 | Doctor auth, patient assignment (RLS), LLM risk assessment, feedback, retrain queue, LangGraph agent |
 | `postcare-api` | 8003 | Care plan generation, follow-up check-ins, escalation creation |
 | `patient-portal` | 3000 | Patient registration, intake wizard, care plan dashboard |
 | `doctor-portal` | 3001 | Patient list, AI risk panel, feedback form, escalation alerts |
@@ -244,6 +247,24 @@ patient-portal
       └── Write AuditLog row
 ```
 
+### Patient Assignment
+
+```
+doctor-portal (or onboarding workflow)
+  → POST /v1/doctor/patients/{id}/assign  (doctor-api:8002)
+      ├── Validate JWT + assert role=doctor
+      ├── Verify patient exists
+      ├── Upsert DoctorPatientAssignment row (idempotent)
+      ├── Write AuditLog row (action: patient_assigned)
+      └── Return AssignmentResponse 201
+
+  → DELETE /v1/doctor/patients/{id}/assign  (doctor-api:8002)
+      ├── Validate JWT + assert role=doctor
+      ├── Verify assignment exists (404 if not)
+      ├── Delete assignment row
+      └── Write AuditLog row (action: patient_unassigned)
+```
+
 ### Risk Assessment
 
 ```
@@ -251,6 +272,7 @@ doctor-portal
   → GET /v1/doctor/patients/{id}/risk  (doctor-api:8002)
       ├── Read doctor_access_token cookie (or Bearer fallback)
       ├── Validate JWT + assert role=doctor
+      ├── Assert doctor is assigned to patient (HTTP 403 if not)
       ├── Read PatientIntake from PostgreSQL
       ├── Check Redis cache (key: risk:{patient_id}, TTL 5m)
       │   ├── HIT  → return cached assessment
@@ -267,7 +289,8 @@ doctor-portal
 ```
 doctor-portal
   → POST /v1/doctor/patients/{id}/feedback  (doctor-api:8002)
-      ├── Write Feedback row
+      ├── Assert doctor is assigned to patient (HTTP 403 if not)
+      ├── Write Feedback row (doctor_id taken from JWT, not request body)
       ├── DELETE Redis key risk:{patient_id}   ← cache invalidated
       └── If action == override|flag:
           └── RPUSH retrain_queue  (Redis)
@@ -599,6 +622,10 @@ In production (behind the ALB), all three API services share the same domain and
 | `CORS_ORIGINS` | all APIs | Comma-separated list of allowed CORS origins. Default: `http://localhost:3000,http://localhost:3001`. Set to real frontend URLs in production. |
 | `COOKIE_DOMAIN` | all APIs | `Domain` attribute for session cookies. Default: `localhost`. Set to your domain (e.g. `api.example.com`) or leave blank in production to resolve to the request host. |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | all APIs | OTLP/HTTP base URL for traces and metrics. Default: `http://otel-collector:4318`. Set in `docker-compose.yml`; override for a remote collector in AWS. |
+| `CHROMA_CLIENT_TYPE` | doctor-api (agent) | ChromaDB client mode: `ephemeral` (default, in-memory), `persistent` (local disk at `/app/data/chroma`), or `http` (external ChromaDB service). |
+| `CHROMA_HOST` | doctor-api (agent) | Hostname for ChromaDB HTTP client. Default: `chroma`. Only used when `CHROMA_CLIENT_TYPE=http`. |
+| `CHROMA_PORT` | doctor-api (agent) | Port for ChromaDB HTTP client. Default: `8000`. Only used when `CHROMA_CLIENT_TYPE=http`. |
+| `RETRAIN_SCORE_THRESHOLD` | doctor-api (agent) | Agent feedback scores below this value trigger a retrain queue push. Default: `0.4`. |
 | `NEXT_PUBLIC_PATIENT_API_URL` | patient-portal | Browser-visible patient API base URL |
 | `NEXT_PUBLIC_DOCTOR_API_URL` | doctor-portal | Browser-visible doctor API base URL |
 | `NEXT_PUBLIC_POSTCARE_API_URL` | both portals | Browser-visible postcare API base URL |
@@ -621,6 +648,7 @@ In AWS, all secret values (`JWT_SECRET`, `FERNET_KEY`, `INTERNAL_API_KEY`, `DATA
 | PHI decryption failure | Field returns `None`; request continues |
 | Audit log write failure | DB error rolled back; request continues (logging failure ≠ auth failure) |
 | Session cookie missing / expired | HTTP 401 `Not authenticated` |
+| Doctor not assigned to requested patient | HTTP 403 `Not assigned to this patient` — enforced by `_assert_assigned()` on risk, feedback, and escalation routes |
 | Missing `X-Internal-Key` | HTTP 403 `Forbidden` |
 | Rate limit exceeded | HTTP 429 `Too Many Requests` |
 | ECS task crash | ECS restarts the task automatically; ALB removes it from rotation until healthy |

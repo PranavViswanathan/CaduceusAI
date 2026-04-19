@@ -224,7 +224,12 @@ Clear the doctor session cookie.
 
 #### `GET /v1/doctor/patients`
 
-List all patients with their latest intake timestamp.
+List patients **assigned to the authenticated doctor**.
+
+| Param | Type | Default | Notes |
+|---|---|---|---|
+| `limit` | integer | 50 | Max patients to return |
+| `offset` | integer | 0 | Pagination offset |
 
 **Response** `200`:
 ```json
@@ -240,7 +245,37 @@ List all patients with their latest intake timestamp.
 
 ---
 
+#### `POST /v1/doctor/patients/{patient_id}/assign`
+
+Assign a patient to the authenticated doctor. Idempotent — returns the existing assignment if one already exists.
+
+**Response** `201`:
+```json
+{
+  "id": "<uuid>",
+  "doctor_id": "<uuid>",
+  "patient_id": "<uuid>",
+  "assigned_at": "2026-04-19T12:00:00Z"
+}
+```
+
+**Error** `404`: Patient not found.
+
+---
+
+#### `DELETE /v1/doctor/patients/{patient_id}/assign`
+
+Remove the assignment between the authenticated doctor and a patient.
+
+**Response** `204`: No content.
+
+**Error** `404`: Assignment not found.
+
+---
+
 #### `GET /v1/doctor/patients/{patient_id}/risk`
+
+> Requires the authenticated doctor to be assigned to this patient. Returns **HTTP 403** if no assignment exists.
 
 Retrieve (or generate) an AI risk assessment for a patient.
 
@@ -266,6 +301,8 @@ Flow: check Redis cache → call Ollama → fall back to rule-based → store + 
 ---
 
 #### `POST /v1/doctor/patients/{patient_id}/feedback`
+
+> Requires the authenticated doctor to be assigned to this patient. Returns **HTTP 403** if no assignment exists.
 
 Submit clinician feedback on a risk assessment. Also invalidates the Redis cache for this patient's risk assessment (`risk:{patient_id}`).
 
@@ -293,7 +330,7 @@ If `action` is `override` or `flag`, the feedback is also pushed to the Redis `r
 
 #### `GET /v1/escalations/pending`
 
-Returns all unacknowledged escalations.
+Returns unacknowledged escalations **for the authenticated doctor's assigned patients**.
 
 **Response** `200`:
 ```json
@@ -428,7 +465,7 @@ Generate a structured care plan from visit notes. Requires `X-Internal-Key` head
 
 #### `GET /v1/careplan/{patient_id}`
 
-Retrieve the latest care plan for a patient. Requires authenticated doctor session.
+Retrieve the latest care plan for a patient. Requires authenticated session. Doctors may access any patient; patients may only access their own care plan (returns **HTTP 403** otherwise).
 
 **Response** `200`: same shape as the create response.
 
