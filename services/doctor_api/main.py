@@ -27,6 +27,7 @@ from schemas import DoctorRegister, FeedbackCreate, LoginResponse, PatientListIt
 from settings import settings
 
 from agent.router import agent_router
+from audit import write_audit
 
 logger = logging.getLogger(__name__)
 
@@ -88,15 +89,6 @@ def _get_redis():
     except Exception:
         return None
 
-
-def _write_audit(db: Session, route: str, action: str, outcome: str, actor_id=None, patient_id=None, ip=None):
-    try:
-        entry = AuditLog(service="doctor_api", route=route, actor_id=actor_id, patient_id=patient_id, action=action, outcome=outcome, ip_address=ip)
-        db.add(entry)
-        db.commit()
-    except Exception as exc:
-        db.rollback()
-        logger.error("CRITICAL: audit log write failed (route=%s action=%s): %s", route, action, exc)
 
 
 def _set_auth_cookie(response: Response, token: str) -> None:
@@ -167,9 +159,11 @@ def list_patients(
     request: Request,
     current_doctor: Doctor = Depends(get_current_doctor),
     db: Session = Depends(get_db),
+    limit: int = 50,
+    offset: int = 0,
 ):
     try:
-        patients = db.query(Patient).all()
+        patients = db.query(Patient).offset(offset).limit(limit).all()
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
 
@@ -269,7 +263,7 @@ async def get_patient_risk(
         except Exception as exc:
             logger.warning("Redis write error: %s", exc)
 
-    _write_audit(db, f"/v1/doctor/patients/{patient_id}/risk", "risk_assessed", "success", str(current_doctor.id), patient_id, request.client.host if request.client else None)
+    write_audit(db, f"/v1/doctor/patients/{patient_id}/risk", "risk_assessed", "success", str(current_doctor.id), patient_id, request.client.host if request.client else None)
     write_structured_log(f"/v1/doctor/patients/{patient_id}/risk", "risk_assessed", "success", request, str(current_doctor.id), patient_id)
     return response
 
@@ -318,7 +312,7 @@ def submit_feedback(
             except Exception as exc:
                 logger.warning("Redis LPUSH failed: %s", exc)
 
-    _write_audit(db, f"/v1/doctor/patients/{patient_id}/feedback", "feedback_submit", "success", str(current_doctor.id), patient_id, request.client.host if request.client else None)
+    write_audit(db, f"/v1/doctor/patients/{patient_id}/feedback", "feedback_submit", "success", str(current_doctor.id), patient_id, request.client.host if request.client else None)
     write_structured_log(f"/v1/doctor/patients/{patient_id}/feedback", "feedback_submit", "success", request, str(current_doctor.id), patient_id)
     return {"status": "recorded"}
 

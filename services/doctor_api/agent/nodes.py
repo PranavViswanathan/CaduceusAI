@@ -23,9 +23,9 @@ from opentelemetry import metrics, trace
 from sqlalchemy.orm import Session
 
 from encryption import encrypt
-from models import AuditLog
 from settings import settings
 
+from audit import write_audit
 from .knowledge_base import retrieve
 from .models import AgentEscalation
 from .state import AgentState
@@ -64,32 +64,6 @@ def _parse_json_response(raw: str) -> dict:
     except json.JSONDecodeError as exc:
         logger.warning("_parse_json_response: failed to parse JSON (%s)", exc)
         return {}
-
-
-def _write_audit(
-    db: Session,
-    route: str,
-    action: str,
-    outcome: str,
-    actor_id: Optional[str] = None,
-    patient_id: Optional[str] = None,
-    ip: Optional[str] = None,
-) -> None:
-    try:
-        entry = AuditLog(
-            service="doctor_api",
-            route=route,
-            actor_id=actor_id,
-            patient_id=patient_id,
-            action=action,
-            outcome=outcome,
-            ip_address=ip,
-        )
-        db.add(entry)
-        db.commit()
-    except Exception as exc:
-        db.rollback()
-        logger.error("CRITICAL: audit log write failed (route=%s action=%s): %s", route, action, exc)
 
 
 # ── Node 1: triage_node ───────────────────────────────────────────────────────
@@ -314,7 +288,7 @@ async def escalation_node(state: AgentState, config: RunnableConfig) -> dict:
             attributes={"agent.node": "escalation"},
         )
 
-    _write_audit(
+    write_audit(
         db,
         route="/v1/agent/query",
         action="agent_escalation",
@@ -383,7 +357,7 @@ async def retraining_trigger_node(state: AgentState, config: RunnableConfig) -> 
             attributes={"agent.node": "retraining_trigger"},
         )
 
-    _write_audit(
+    write_audit(
         db,
         route="/v1/agent/query",
         action="agent_query_complete",

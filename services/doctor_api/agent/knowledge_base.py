@@ -9,6 +9,8 @@ Swap ``chromadb.EphemeralClient`` for ``chromadb.HttpClient`` (or
 production.
 """
 
+import os
+
 import chromadb
 from chromadb.utils.embedding_functions import DefaultEmbeddingFunction
 
@@ -98,7 +100,16 @@ _DOCUMENTS: list[str] = [
     ),
 ]
 
-_client = chromadb.EphemeralClient()
+_kb_type = os.getenv("CHROMA_CLIENT_TYPE", "ephemeral")
+if _kb_type == "persistent":
+    _client = chromadb.PersistentClient(path="/app/data/chroma")
+elif _kb_type == "http":
+    _client = chromadb.HttpClient(
+        host=os.getenv("CHROMA_HOST", "chroma"),
+        port=int(os.getenv("CHROMA_PORT", "8000")),
+    )
+else:
+    _client = chromadb.EphemeralClient()
 _collection = _client.get_or_create_collection(
     name="clinical_kb",
     embedding_function=DefaultEmbeddingFunction(),
