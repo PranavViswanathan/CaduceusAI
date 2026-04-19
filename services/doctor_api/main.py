@@ -22,8 +22,8 @@ from database import Base, SessionLocal, engine, get_db
 from encryption import decrypt
 from llm import get_risk_assessment
 from logging_utils import write_structured_log
-from models import AuditLog, Doctor, Escalation, FollowupCheckin, Patient, PatientIntake, RiskAssessment, Feedback
-from schemas import DoctorRegister, FeedbackCreate, LoginResponse, PatientListItem, RiskAssessmentResponse
+from models import AuditLog, Doctor, DoctorPatientAssignment, Escalation, FollowupCheckin, Patient, PatientIntake, RiskAssessment, Feedback
+from schemas import AssignmentResponse, DoctorRegister, FeedbackCreate, LoginResponse, PatientListItem, RiskAssessmentResponse
 from settings import settings
 
 from agent.router import agent_router
@@ -104,6 +104,19 @@ def _set_auth_cookie(response: Response, token: str) -> None:
     )
 
 
+def _assert_assigned(doctor_id, patient_id: str, db: Session) -> None:
+    assignment = (
+        db.query(DoctorPatientAssignment)
+        .filter(
+            DoctorPatientAssignment.doctor_id == doctor_id,
+            DoctorPatientAssignment.patient_id == patient_id,
+        )
+        .first()
+    )
+    if not assignment:
+        raise HTTPException(status_code=403, detail="Not assigned to this patient")
+
+
 @router.post("/auth/register", status_code=201)
 def register_doctor(body: DoctorRegister, db: Session = Depends(get_db)):
     if db.query(Doctor).filter(Doctor.email == body.email).first():
@@ -163,7 +176,14 @@ def list_patients(
     offset: int = 0,
 ):
     try:
-        patients = db.query(Patient).offset(offset).limit(limit).all()
+        patients = (
+            db.query(Patient)
+            .join(DoctorPatientAssignment, DoctorPatientAssignment.patient_id == Patient.id)
+            .filter(DoctorPatientAssignment.doctor_id == current_doctor.id)
+            .offset(offset)
+            .limit(limit)
+            .all()
+        )
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
 
@@ -181,6 +201,73 @@ def list_patients(
     return result
 
 
+@router.post("/doctor/patients/{patient_id}/assign", response_model=AssignmentResponse, status_code=201)
+def assign_patient(
+    patient_id: str,
+    request: Request,
+    current_doctor: Doctor = Depends(get_current_doctor),
+    db: Session = Depends(get_db),
+):
+    patient = db.query(Patient).filter(Patient.id == patient_id).first()
+    if not patient:
+        raise HTTPException(status_code=404, detail="Patient not found")
+
+    existing = (
+        db.query(DoctorPatientAssignment)
+        .filter(
+            DoctorPatientAssignment.doctor_id == current_doctor.id,
+            DoctorPatientAssignment.patient_id == patient_id,
+        )
+        .first()
+    )
+    if existing:
+        return AssignmentResponse.model_validate(existing)
+
+    try:
+        assignment = DoctorPatientAssignment(
+            doctor_id=current_doctor.id,
+            patient_id=patient_id,
+            assigned_by=current_doctor.id,
+        )
+        db.add(assignment)
+        db.commit()
+        db.refresh(assignment)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+
+    write_audit(db, f"/v1/doctor/patients/{patient_id}/assign", "patient_assigned", "success", str(current_doctor.id), patient_id, request.client.host if request.client else None)
+    return AssignmentResponse.model_validate(assignment)
+
+
+@router.delete("/doctor/patients/{patient_id}/assign", status_code=204)
+def unassign_patient(
+    patient_id: str,
+    request: Request,
+    current_doctor: Doctor = Depends(get_current_doctor),
+    db: Session = Depends(get_db),
+):
+    assignment = (
+        db.query(DoctorPatientAssignment)
+        .filter(
+            DoctorPatientAssignment.doctor_id == current_doctor.id,
+            DoctorPatientAssignment.patient_id == patient_id,
+        )
+        .first()
+    )
+    if not assignment:
+        raise HTTPException(status_code=404, detail="Assignment not found")
+
+    try:
+        db.delete(assignment)
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+
+    write_audit(db, f"/v1/doctor/patients/{patient_id}/assign", "patient_unassigned", "success", str(current_doctor.id), patient_id, request.client.host if request.client else None)
+
+
 @router.get("/doctor/patients/{patient_id}/risk", response_model=RiskAssessmentResponse)
 async def get_patient_risk(
     patient_id: str,
@@ -188,6 +275,7 @@ async def get_patient_risk(
     current_doctor: Doctor = Depends(get_current_doctor),
     db: Session = Depends(get_db),
 ):
+    _assert_assigned(current_doctor.id, patient_id, db)
     redis = _get_redis()
     cache_key = f"risk:{patient_id}"
 
@@ -276,6 +364,7 @@ def submit_feedback(
     current_doctor: Doctor = Depends(get_current_doctor),
     db: Session = Depends(get_db),
 ):
+    _assert_assigned(current_doctor.id, patient_id, db)
     try:
         fb = Feedback(
             patient_id=patient_id,
@@ -302,7 +391,7 @@ def submit_feedback(
             try:
                 payload = json.dumps({
                     "patient_id": patient_id,
-                    "doctor_id": body.doctor_id,
+                    "doctor_id": str(current_doctor.id),
                     "action": body.action,
                     "reason": body.reason,
                     "assessment_id": body.assessment_id,
@@ -390,7 +479,19 @@ def pending_escalations(
     db: Session = Depends(get_db),
 ):
     try:
-        escalations = db.query(Escalation).filter(Escalation.acknowledged == False).all()
+        assigned_patient_ids = (
+            db.query(DoctorPatientAssignment.patient_id)
+            .filter(DoctorPatientAssignment.doctor_id == current_doctor.id)
+            .subquery()
+        )
+        escalations = (
+            db.query(Escalation)
+            .filter(
+                Escalation.acknowledged.is_(False),
+                Escalation.patient_id.in_(assigned_patient_ids),
+            )
+            .all()
+        )
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=503, detail="Database unavailable") from exc
 

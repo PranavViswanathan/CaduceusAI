@@ -83,10 +83,19 @@ class RiskAssessmentResponse(BaseModel):
         from_attributes = True
 
 
+class AssignmentResponse(BaseModel):
+    id: UUID
+    doctor_id: UUID
+    patient_id: UUID
+    assigned_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 class FeedbackCreate(BaseModel):
     action: str
     reason: str | None = None
-    doctor_id: str
     assessment_id: str | None = None
 
     @field_validator("action")

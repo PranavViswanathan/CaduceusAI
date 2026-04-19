@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, Boolean, Column, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import BigInteger, Boolean, Column, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSON, UUID
 
 from database import Base
@@ -88,6 +88,22 @@ class Escalation(Base):
     acknowledged = Column(Boolean, default=False)
     acknowledged_by = Column(UUID(as_uuid=True), nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class DoctorPatientAssignment(Base):
+    __tablename__ = "doctor_patient_assignments"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    doctor_id = Column(UUID(as_uuid=True), ForeignKey("doctors.id"), nullable=False)
+    patient_id = Column(UUID(as_uuid=True), ForeignKey("patients.id"), nullable=False)
+    assigned_at = Column(DateTime, default=datetime.utcnow)
+    assigned_by = Column(UUID(as_uuid=True), nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("doctor_id", "patient_id", name="uq_doctor_patient"),
+        Index("ix_dpa_doctor_id", "doctor_id"),
+        Index("ix_dpa_patient_id", "patient_id"),
+    )
 
 
 class AuditLog(Base):
