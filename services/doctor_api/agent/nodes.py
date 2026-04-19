@@ -13,11 +13,13 @@ import json
 import logging
 import os
 import re
+import time
 from datetime import datetime
 from typing import Optional
 
 import httpx
 from langchain_core.runnables import RunnableConfig
+from opentelemetry import metrics, trace
 from sqlalchemy.orm import Session
 
 from encryption import encrypt
@@ -30,8 +32,14 @@ from .state import AgentState
 
 logger = logging.getLogger(__name__)
 
-# Feedback score below this value triggers a retraining job.
-# Override via RETRAIN_SCORE_THRESHOLD env variable.
+tracer = trace.get_tracer(__name__)
+_meter = metrics.get_meter(__name__)
+_node_duration = _meter.create_histogram(
+    "agent.node.duration",
+    unit="s",
+    description="Duration of LangGraph agent node execution",
+)
+
 _RETRAIN_SCORE_THRESHOLD: float = float(
     os.getenv("RETRAIN_SCORE_THRESHOLD", "0.4")
 )
@@ -41,11 +49,6 @@ _RETRAIN_SCORE_THRESHOLD: float = float(
 
 
 def _parse_json_response(raw: str) -> dict:
-    """Extract and parse the first JSON object from a raw LLM text response.
-
-    Uses the same greedy-then-liberal regex strategy as the existing llm.py so
-    that whitespace and prose around the JSON block are handled consistently.
-    """
     raw = raw.strip()
     match = re.search(r"\{.*?\}", raw, re.DOTALL)
     if not match:
@@ -72,11 +75,6 @@ def _write_audit(
     patient_id: Optional[str] = None,
     ip: Optional[str] = None,
 ) -> None:
-    """Persist an audit log entry to the audit_log table.
-
-    Mirrors the _write_audit helper in main.py exactly so that agent-generated
-    events appear alongside all other doctor_api audit events.
-    """
     try:
         entry = AuditLog(
             service="doctor_api",
@@ -97,15 +95,7 @@ def _write_audit(
 
 
 async def triage_node(state: AgentState, config: RunnableConfig) -> dict:
-    """Classify the incoming clinical query as 'routine', 'complex', or 'urgent'.
-
-    Calls the local Ollama model with a structured prompt that defines each
-    category in clinical terms.  Falls back to 'complex' (the safest default)
-    if Ollama is unreachable, times out, or returns an invalid classification.
-    No audit log is written here — audit happens at terminal nodes only.
-    """
     query = state["query"]
-
     prompt = (
         "You are a medical query triage system. Classify the query below into exactly one of: "
         "routine, complex, urgent.\n\n"
@@ -122,28 +112,37 @@ async def triage_node(state: AgentState, config: RunnableConfig) -> dict:
         'or {"classification": "complex"} or {"classification": "urgent"}'
     )
 
-    query_type = "complex"  # conservative fallback
+    query_type = "complex"
+    t0 = time.perf_counter()
 
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                f"{settings.OLLAMA_URL}/api/generate",
-                json={"model": "llama3", "prompt": prompt, "stream": False},
-            )
-            resp.raise_for_status()
-            raw = resp.json().get("response", "")
-            parsed = _parse_json_response(raw)
-            label = parsed.get("classification", "").lower()
-            if label in ("routine", "complex", "urgent"):
-                query_type = label
-            else:
-                logger.warning(
-                    "triage_node: unexpected classification %r — defaulting to 'complex'", label
+    with tracer.start_as_current_span("agent.triage") as span:
+        span.set_attribute("agent.node", "triage")
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    f"{settings.OLLAMA_URL}/api/generate",
+                    json={"model": "llama3", "prompt": prompt, "stream": False},
                 )
-    except httpx.ConnectError:
-        logger.warning("triage_node: Ollama unreachable — defaulting to 'complex'")
-    except Exception as exc:
-        logger.warning("triage_node: inference failed (%s) — defaulting to 'complex'", exc)
+                resp.raise_for_status()
+                raw = resp.json().get("response", "")
+                parsed = _parse_json_response(raw)
+                label = parsed.get("classification", "").lower()
+                if label in ("routine", "complex", "urgent"):
+                    query_type = label
+                else:
+                    logger.warning(
+                        "triage_node: unexpected classification %r — defaulting to 'complex'", label
+                    )
+        except httpx.ConnectError:
+            logger.warning("triage_node: Ollama unreachable — defaulting to 'complex'")
+        except Exception as exc:
+            logger.warning("triage_node: inference failed (%s) — defaulting to 'complex'", exc)
+
+        span.set_attribute("agent.query_type", query_type)
+        _node_duration.record(
+            time.perf_counter() - t0,
+            attributes={"agent.node": "triage"},
+        )
 
     return {"query_type": query_type}
 
@@ -152,16 +151,7 @@ async def triage_node(state: AgentState, config: RunnableConfig) -> dict:
 
 
 async def rag_node(state: AgentState, config: RunnableConfig) -> dict:
-    """Handle routine queries via retrieval-augmented generation.
-
-    Retrieves the most relevant documents from the in-memory knowledge base,
-    then prompts Ollama to synthesise an answer grounded in that context.
-    If retrieval yields no documents or inference fails, a safe fallback message
-    is returned.  The audit log entry is written by the downstream
-    retraining_trigger_node which is the terminal node for this path.
-    """
     query = state["query"]
-
     docs = retrieve(query)
     context = "\n\n---\n\n".join(docs) if docs else "No relevant documents found."
 
@@ -182,22 +172,32 @@ async def rag_node(state: AgentState, config: RunnableConfig) -> dict:
         "Please consult current clinical guidelines or a specialist."
     )
     confidence = 0.2
+    t0 = time.perf_counter()
 
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            resp = await client.post(
-                f"{settings.OLLAMA_URL}/api/generate",
-                json={"model": "llama3", "prompt": prompt, "stream": False},
-            )
-            resp.raise_for_status()
-            raw = resp.json().get("response", "")
-            parsed = _parse_json_response(raw)
-            response_text = parsed.get("response", response_text)
-            confidence = max(0.0, min(1.0, float(parsed.get("confidence", 0.2))))
-    except httpx.ConnectError:
-        logger.warning("rag_node: Ollama unreachable — returning fallback response")
-    except Exception as exc:
-        logger.warning("rag_node: inference failed (%s) — returning fallback response", exc)
+    with tracer.start_as_current_span("agent.rag") as span:
+        span.set_attribute("agent.node", "rag")
+        span.set_attribute("agent.docs_retrieved", len(docs))
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                resp = await client.post(
+                    f"{settings.OLLAMA_URL}/api/generate",
+                    json={"model": "llama3", "prompt": prompt, "stream": False},
+                )
+                resp.raise_for_status()
+                raw = resp.json().get("response", "")
+                parsed = _parse_json_response(raw)
+                response_text = parsed.get("response", response_text)
+                confidence = max(0.0, min(1.0, float(parsed.get("confidence", 0.2))))
+        except httpx.ConnectError:
+            logger.warning("rag_node: Ollama unreachable — returning fallback response")
+        except Exception as exc:
+            logger.warning("rag_node: inference failed (%s) — returning fallback response", exc)
+
+        span.set_attribute("agent.confidence", confidence)
+        _node_duration.record(
+            time.perf_counter() - t0,
+            attributes={"agent.node": "rag"},
+        )
 
     return {
         "rag_context": docs,
@@ -210,17 +210,7 @@ async def rag_node(state: AgentState, config: RunnableConfig) -> dict:
 
 
 async def reasoning_node(state: AgentState, config: RunnableConfig) -> dict:
-    """Handle complex queries with step-by-step chain-of-thought reasoning.
-
-    Prompts Ollama to reason explicitly before producing a final answer and a
-    self-reported confidence score.  If confidence < 0.5 the graph routes to
-    escalation_node; otherwise it routes to retraining_trigger_node.
-    Defaults to low confidence on any inference failure so the query is
-    escalated rather than answered incorrectly.
-    The audit log entry is written by the downstream terminal node.
-    """
     query = state["query"]
-
     prompt = (
         "You are a clinical reasoning assistant. Think through the query step-by-step "
         "before producing a final answer.\n\n"
@@ -242,25 +232,34 @@ async def reasoning_node(state: AgentState, config: RunnableConfig) -> dict:
         "Please consult the relevant department."
     )
     chain_of_thought = ""
-    confidence = 0.3  # below threshold → escalation path
+    confidence = 0.3
+    t0 = time.perf_counter()
 
-    try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            resp = await client.post(
-                f"{settings.OLLAMA_URL}/api/generate",
-                json={"model": "llama3", "prompt": prompt, "stream": False},
+    with tracer.start_as_current_span("agent.reasoning") as span:
+        span.set_attribute("agent.node", "reasoning")
+        try:
+            async with httpx.AsyncClient(timeout=120.0) as client:
+                resp = await client.post(
+                    f"{settings.OLLAMA_URL}/api/generate",
+                    json={"model": "llama3", "prompt": prompt, "stream": False},
+                )
+                resp.raise_for_status()
+                raw = resp.json().get("response", "")
+                parsed = _parse_json_response(raw)
+                response_text = parsed.get("response", response_text)
+                chain_of_thought = parsed.get("chain_of_thought", "")
+                confidence = max(0.0, min(1.0, float(parsed.get("confidence", 0.3))))
+        except httpx.ConnectError:
+            logger.warning("reasoning_node: Ollama unreachable — defaulting to low confidence")
+        except Exception as exc:
+            logger.warning(
+                "reasoning_node: inference failed (%s) — defaulting to low confidence", exc
             )
-            resp.raise_for_status()
-            raw = resp.json().get("response", "")
-            parsed = _parse_json_response(raw)
-            response_text = parsed.get("response", response_text)
-            chain_of_thought = parsed.get("chain_of_thought", "")
-            confidence = max(0.0, min(1.0, float(parsed.get("confidence", 0.3))))
-    except httpx.ConnectError:
-        logger.warning("reasoning_node: Ollama unreachable — defaulting to low confidence")
-    except Exception as exc:
-        logger.warning(
-            "reasoning_node: inference failed (%s) — defaulting to low confidence", exc
+
+        span.set_attribute("agent.confidence", confidence)
+        _node_duration.record(
+            time.perf_counter() - t0,
+            attributes={"agent.node": "reasoning"},
         )
 
     return {
@@ -274,13 +273,6 @@ async def reasoning_node(state: AgentState, config: RunnableConfig) -> dict:
 
 
 async def escalation_node(state: AgentState, config: RunnableConfig) -> dict:
-    """Flag urgent or low-confidence queries for clinician review.
-
-    Creates an AgentEscalation record in PostgreSQL with the raw query stored
-    PHI-encrypted (Fernet/AES-256) so that the query text never rests in plain
-    text.  Returns a 'pending clinician review' response to the caller.
-    Writes the terminal audit log entry.
-    """
     db: Session = config["configurable"]["db"]
     query = state["query"]
     actor_id = state.get("actor_id")
@@ -290,26 +282,36 @@ async def escalation_node(state: AgentState, config: RunnableConfig) -> dict:
 
     escalation_id: Optional[str] = None
     outcome = "db_error"
+    t0 = time.perf_counter()
 
-    try:
-        escalation = AgentEscalation(
-            patient_id=patient_id,
-            query_encrypted=encrypt(query),
-            query_type=query_type,
-            reason=f"Agent-triaged as '{query_type}'; routed to clinician review.",
-            actor_id=actor_id,
-        )
-        db.add(escalation)
-        db.commit()
-        db.refresh(escalation)
-        escalation_id = str(escalation.id)
-        outcome = "escalated"
-    except Exception as exc:
-        logger.error("escalation_node: failed to write AgentEscalation (%s)", exc)
+    with tracer.start_as_current_span("agent.escalation") as span:
+        span.set_attribute("agent.node", "escalation")
+        span.set_attribute("agent.query_type", query_type)
         try:
-            db.rollback()
-        except Exception:
-            pass
+            escalation = AgentEscalation(
+                patient_id=patient_id,
+                query_encrypted=encrypt(query),
+                query_type=query_type,
+                reason=f"Agent-triaged as '{query_type}'; routed to clinician review.",
+                actor_id=actor_id,
+            )
+            db.add(escalation)
+            db.commit()
+            db.refresh(escalation)
+            escalation_id = str(escalation.id)
+            outcome = "escalated"
+        except Exception as exc:
+            logger.error("escalation_node: failed to write AgentEscalation (%s)", exc)
+            try:
+                db.rollback()
+            except Exception:
+                pass
+
+        span.set_attribute("agent.outcome", outcome)
+        _node_duration.record(
+            time.perf_counter() - t0,
+            attributes={"agent.node": "escalation"},
+        )
 
     _write_audit(
         db,
@@ -336,16 +338,6 @@ async def escalation_node(state: AgentState, config: RunnableConfig) -> dict:
 
 
 async def retraining_trigger_node(state: AgentState, config: RunnableConfig) -> dict:
-    """Conditionally enqueue a retraining job based on clinician feedback score.
-
-    Checks whether *feedback_score* passed in the request state falls below
-    _RETRAIN_SCORE_THRESHOLD (default 0.4, overridable via env var).  If so,
-    pushes a job payload to the Redis 'retrain_queue' using the same format as
-    the existing /v1/doctor/patients/{id}/feedback endpoint so that the retrain
-    pipeline processes both signal sources identically.
-    Always writes the terminal audit log entry regardless of whether a retrain
-    job was enqueued.
-    """
     db: Session = config["configurable"]["db"]
     redis = config["configurable"].get("redis")
     actor_id = state.get("actor_id")
@@ -355,31 +347,40 @@ async def retraining_trigger_node(state: AgentState, config: RunnableConfig) -> 
     feedback_assessment_id = state.get("feedback_assessment_id")
 
     retrain_enqueued = False
+    t0 = time.perf_counter()
 
-    if (
-        redis is not None
-        and feedback_score is not None
-        and feedback_score < _RETRAIN_SCORE_THRESHOLD
-    ):
-        try:
-            payload = json.dumps({
-                "patient_id": patient_id,
-                "assessment_id": feedback_assessment_id,
-                "feedback_score": feedback_score,
-                "action": "agent_low_score",
-                "timestamp": datetime.utcnow().isoformat(),
-            })
-            redis.lpush("retrain_queue", payload)
-            retrain_enqueued = True
-            logger.info(
-                "retraining_trigger_node: enqueued retrain job "
-                "(score=%.2f threshold=%.2f assessment=%s)",
-                feedback_score,
-                _RETRAIN_SCORE_THRESHOLD,
-                feedback_assessment_id,
-            )
-        except Exception as exc:
-            logger.warning("retraining_trigger_node: Redis lpush failed (%s)", exc)
+    with tracer.start_as_current_span("agent.retraining_trigger") as span:
+        span.set_attribute("agent.node", "retraining_trigger")
+        if (
+            redis is not None
+            and feedback_score is not None
+            and feedback_score < _RETRAIN_SCORE_THRESHOLD
+        ):
+            try:
+                payload = json.dumps({
+                    "patient_id": patient_id,
+                    "assessment_id": feedback_assessment_id,
+                    "feedback_score": feedback_score,
+                    "action": "agent_low_score",
+                    "timestamp": datetime.utcnow().isoformat(),
+                })
+                redis.lpush("retrain_queue", payload)
+                retrain_enqueued = True
+                logger.info(
+                    "retraining_trigger_node: enqueued retrain job "
+                    "(score=%.2f threshold=%.2f assessment=%s)",
+                    feedback_score,
+                    _RETRAIN_SCORE_THRESHOLD,
+                    feedback_assessment_id,
+                )
+            except Exception as exc:
+                logger.warning("retraining_trigger_node: Redis lpush failed (%s)", exc)
+
+        span.set_attribute("agent.retrain_enqueued", retrain_enqueued)
+        _node_duration.record(
+            time.perf_counter() - t0,
+            attributes={"agent.node": "retraining_trigger"},
+        )
 
     _write_audit(
         db,

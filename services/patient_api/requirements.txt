@@ -13,3 +13,10 @@ python-multipart==0.0.9
 slowapi==0.1.9
 alembic==1.13.1
 email-validator==2.1.1
+opentelemetry-api==1.24.0
+opentelemetry-sdk==1.24.0
+opentelemetry-exporter-otlp-proto-http==1.24.0
+opentelemetry-instrumentation-fastapi==0.45b0
+opentelemetry-instrumentation-sqlalchemy==0.45b0
+opentelemetry-instrumentation-redis==0.45b0
+opentelemetry-instrumentation-httpx==0.45b0

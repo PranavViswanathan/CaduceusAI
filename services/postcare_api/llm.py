@@ -1,13 +1,27 @@
 import json
 import logging
 import re
+import time
 from datetime import datetime, timedelta
 
 import httpx
+from opentelemetry import metrics, trace
 
 from settings import settings
 
 logger = logging.getLogger(__name__)
+
+tracer = trace.get_tracer(__name__)
+_meter = metrics.get_meter(__name__)
+_ollama_duration = _meter.create_histogram(
+    "ollama.request.duration",
+    unit="s",
+    description="Duration of Ollama LLM inference calls",
+)
+_ollama_fallback = _meter.create_counter(
+    "ollama.fallback",
+    description="Times rule-based fallback was used instead of Ollama",
+)
 
 _STATIC_CARE_PLAN = {
     "follow_up_date": (datetime.utcnow() + timedelta(days=14)).date().isoformat(),
@@ -58,23 +72,34 @@ async def generate_care_plan(patient_id: str, visit_notes: str) -> dict:
         '"warning_signs": ["sign1 the patient should call about", "sign2"]}}\n\n'
         f"Visit Notes:\n{visit_notes}"
     )
+    attrs = {"ollama.operation": "care_plan"}
 
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                f"{settings.OLLAMA_URL}/api/generate",
-                json={"model": "llama3", "prompt": prompt, "stream": False},
-            )
-            resp.raise_for_status()
-            raw = resp.json().get("response", "")
-            parsed = _parse_json_response(raw)
-            for field in ("follow_up_date", "medications_to_monitor", "lifestyle_recommendations", "warning_signs"):
-                if field not in parsed:
-                    raise ValueError(f"Missing field: {field}")
-            return parsed
-    except Exception as exc:
-        logger.warning("Ollama care plan generation failed: %s — using static template", exc)
-        return _STATIC_CARE_PLAN.copy()
+    with tracer.start_as_current_span("ollama.care_plan") as span:
+        span.set_attribute("ollama.operation", "care_plan")
+        t0 = time.perf_counter()
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    f"{settings.OLLAMA_URL}/api/generate",
+                    json={"model": "llama3", "prompt": prompt, "stream": False},
+                )
+                resp.raise_for_status()
+                raw = resp.json().get("response", "")
+                parsed = _parse_json_response(raw)
+                for field in ("follow_up_date", "medications_to_monitor", "lifestyle_recommendations", "warning_signs"):
+                    if field not in parsed:
+                        raise ValueError(f"Missing field: {field}")
+                _ollama_duration.record(
+                    time.perf_counter() - t0,
+                    attributes={**attrs, "ollama.model": "llama3"},
+                )
+                span.set_attribute("ollama.model", "llama3")
+                return parsed
+        except Exception as exc:
+            logger.warning("Ollama care plan generation failed: %s — using static template", exc)
+            _ollama_fallback.add(1, attributes=attrs)
+            span.set_attribute("ollama.fallback", True)
+            return _STATIC_CARE_PLAN.copy()
 
 
 def _rule_based_urgency(symptom_report: str) -> dict:
@@ -98,19 +123,30 @@ async def assess_checkin_urgency(symptom_report: str, care_plan: dict) -> dict:
         f"Care Plan Warning Signs:\n{chr(10).join(f'- {s}' for s in warning_signs)}\n\n"
         f"Patient Symptom Report:\n{symptom_report}"
     )
+    attrs = {"ollama.operation": "urgency_assessment"}
 
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.post(
-                f"{settings.OLLAMA_URL}/api/generate",
-                json={"model": "llama3", "prompt": prompt, "stream": False},
-            )
-            resp.raise_for_status()
-            raw = resp.json().get("response", "")
-            parsed = _parse_json_response(raw)
-            if parsed.get("urgency") not in ("routine", "monitor", "escalate"):
-                raise ValueError("Invalid urgency value")
-            return parsed
-    except Exception as exc:
-        logger.warning("Ollama urgency assessment failed: %s — using rule-based fallback", exc)
-        return _rule_based_urgency(symptom_report)
+    with tracer.start_as_current_span("ollama.urgency_assessment") as span:
+        span.set_attribute("ollama.operation", "urgency_assessment")
+        t0 = time.perf_counter()
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(
+                    f"{settings.OLLAMA_URL}/api/generate",
+                    json={"model": "llama3", "prompt": prompt, "stream": False},
+                )
+                resp.raise_for_status()
+                raw = resp.json().get("response", "")
+                parsed = _parse_json_response(raw)
+                if parsed.get("urgency") not in ("routine", "monitor", "escalate"):
+                    raise ValueError("Invalid urgency value")
+                _ollama_duration.record(
+                    time.perf_counter() - t0,
+                    attributes={**attrs, "ollama.model": "llama3"},
+                )
+                span.set_attribute("ollama.model", "llama3")
+                return parsed
+        except Exception as exc:
+            logger.warning("Ollama urgency assessment failed: %s — using rule-based fallback", exc)
+            _ollama_fallback.add(1, attributes=attrs)
+            span.set_attribute("ollama.fallback", True)
+            return _rule_based_urgency(symptom_report)

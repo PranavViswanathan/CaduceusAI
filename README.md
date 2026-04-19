@@ -38,6 +38,10 @@ The stack runs as a Docker Compose application with dependency-ordered startup, 
 ├─────────────────────────────────────────────────────────────┤
 │  SHARED INFRASTRUCTURE                                      │
 │  PostgreSQL :5432 | Redis :6379 | Ollama :11434             │
+├─────────────────────────────────────────────────────────────┤
+│  OBSERVABILITY                                              │
+│  OTel Collector :4318 | Prometheus :9090                    │
+│  Grafana :3030          | Jaeger :16686                     │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -58,6 +62,10 @@ The stack runs as a Docker Compose application with dependency-ordered startup, 
 | `ollama-init` | — | One-shot service that pulls llama3 + mistral on first boot |
 | `migrate` | — | One-shot service that runs Alembic migrations before APIs start |
 | `retrain-worker` | — | Continuous PEFT LoRA training loop; registers fine-tuned model with Ollama |
+| `otel-collector` | 4317/4318 | Receives OTLP spans + metrics from all APIs; converts traces → metrics via spanmetrics connector |
+| `prometheus` | 9090 | Scrapes metrics endpoint from OTel Collector every 15 s |
+| `grafana` | 3030 | Pre-provisioned dashboards over Prometheus metrics and Jaeger traces (admin / admin) |
+| `jaeger` | 16686 | Distributed trace storage and query UI |
 
 ---
 
@@ -130,6 +138,9 @@ docker compose down -v  # stop and delete all data volumes
 | Patient API docs | http://localhost:8001/docs |
 | Doctor API docs | http://localhost:8002/docs |
 | PostCare API docs | http://localhost:8003/docs |
+| Grafana dashboards | http://localhost:3030 (admin / admin) |
+| Prometheus | http://localhost:9090 |
+| Jaeger traces | http://localhost:16686 |
 
 ### 4. Bootstrap a doctor account
 
@@ -197,6 +208,60 @@ terraform output patient_portal_url
 ```
 
 See [Architecture](docs/architecture.md) for the full AWS topology.
+
+---
+
+## Observability
+
+All three API services are instrumented with **OpenTelemetry**. Every request, database query, Redis operation, and Ollama inference call generates a trace and contributes to Prometheus metrics. No code changes are needed to start collecting telemetry — instrumentation activates automatically on startup.
+
+### What is traced
+
+| Signal | Source | Span name |
+|---|---|---|
+| HTTP requests | FastAPI auto-instrumentation | `GET /health`, `POST /v1/auth/token`, … |
+| PostgreSQL queries | SQLAlchemy auto-instrumentation | `SELECT`, `INSERT`, `UPDATE` |
+| Redis commands | Redis auto-instrumentation | `GET`, `SET`, `LPUSH`, `SETEX` |
+| Ollama HTTP calls | HTTPX auto-instrumentation | `HTTP POST` |
+| Ollama risk assessment | Manual span (`doctor_api/llm.py`) | `ollama.risk_assessment` |
+| Ollama care plan | Manual span (`postcare_api/llm.py`) | `ollama.care_plan` |
+| Ollama urgency | Manual span (`postcare_api/llm.py`) | `ollama.urgency_assessment` |
+| Agent triage | Manual span (`agent/nodes.py`) | `agent.triage` |
+| Agent RAG | Manual span (`agent/nodes.py`) | `agent.rag` |
+| Agent reasoning | Manual span (`agent/nodes.py`) | `agent.reasoning` |
+| Agent escalation | Manual span (`agent/nodes.py`) | `agent.escalation` |
+| Agent retrain trigger | Manual span (`agent/nodes.py`) | `agent.retraining_trigger` |
+
+### Prometheus metrics (via spanmetrics connector)
+
+The OTel Collector's `spanmetrics` connector converts every span into two Prometheus metrics:
+
+- `medical_ai_traces_spanmetrics_calls_total` — request rate by `span_name`, `service_name`, `status_code`
+- `medical_ai_traces_spanmetrics_duration_milliseconds_*` — latency histograms with the same labels
+
+Custom histograms and counters exported directly from the SDK:
+
+| Metric | Type | Labels |
+|---|---|---|
+| `medical_ai_ollama_request_duration_seconds` | Histogram | `ollama_model`, `ollama_operation`, `service_name` |
+| `medical_ai_ollama_fallback_total` | Counter | `ollama_operation`, `service_name` |
+| `medical_ai_agent_node_duration_seconds` | Histogram | `agent_node` |
+
+### Grafana dashboard
+
+Open **http://localhost:3030** (admin / admin). The pre-provisioned **Medical AI Platform** dashboard contains nine panels:
+
+1. HTTP request rate by service
+2. HTTP p50 / p95 latency by service
+3. Ollama inference duration (p50 / p95) by operation
+4. Ollama fallback rate (how often rule-based fallback fires)
+5. DB query rate (SELECT / INSERT / UPDATE / DELETE)
+6. DB query p95 latency
+7. Redis operation rate
+8. Agent node p95 duration (bargauge by node name)
+9. Agent node call rate over time
+
+Traces are browsable in **Jaeger** at http://localhost:16686 — search by service name (`patient_api`, `doctor_api`, `postcare_api`) to see end-to-end request traces.
 
 ---
 
@@ -327,6 +392,14 @@ See [Security Model](docs/security.md) for the full production hardening checkli
 medical-ai-platform/
 ├── Makefile                            # start / stop / health targets
 ├── docker-compose.yml
+├── otel-collector-config.yaml          # OTel Collector: OTLP receiver, spanmetrics, Prometheus + Jaeger exporters
+├── prometheus.yml                      # Prometheus scrape config (scrapes otel-collector:8889)
+├── grafana/
+│   ├── provisioning/
+│   │   ├── datasources/datasources.yml # Auto-provision Prometheus + Jaeger datasources
+│   │   └── dashboards/dashboards.yml   # Dashboard file provider config
+│   └── dashboards/
+│       └── medical-ai.json             # 9-panel Medical AI Platform dashboard
 ├── .env.example
 ├── alembic.ini
 ├── alembic/
@@ -338,6 +411,7 @@ medical-ai-platform/
 ├── services/
 │   ├── patient_api/                    # Tier 1 backend (port 8001)
 │   │   ├── main.py
+│   │   ├── telemetry.py                # OTel SDK setup (TracerProvider, MeterProvider, auto-instrumentation)
 │   │   ├── models.py
 │   │   ├── schemas.py
 │   │   ├── auth.py
@@ -349,14 +423,15 @@ medical-ai-platform/
 │   │   └── tests/
 │   ├── doctor_api/                     # Tier 2 backend (port 8002)
 │   │   ├── main.py
-│   │   ├── llm.py
+│   │   ├── telemetry.py                # OTel SDK setup
+│   │   ├── llm.py                      # Ollama calls — manual spans + ollama.request.duration histogram
 │   │   ├── models.py
 │   │   ├── langgraph.json
 │   │   ├── agent/
 │   │   │   ├── state.py
 │   │   │   ├── models.py
 │   │   │   ├── knowledge_base.py
-│   │   │   ├── nodes.py
+│   │   │   ├── nodes.py               # Per-node spans + agent.node.duration histogram
 │   │   │   ├── graph.py
 │   │   │   └── router.py
 │   │   ├── requirements.txt
@@ -364,7 +439,8 @@ medical-ai-platform/
 │   │   └── tests/
 │   └── postcare_api/                   # Tier 3 backend (port 8003)
 │       ├── main.py
-│       ├── llm.py
+│       ├── telemetry.py                # OTel SDK setup
+│       ├── llm.py                      # Ollama calls — manual spans + metrics
 │       ├── requirements.txt
 │       ├── Dockerfile
 │       └── tests/

@@ -34,6 +34,11 @@ app.add_middleware(
 
 router = APIRouter(prefix="/v1")
 
+if not _TESTING:
+    from database import engine as _engine
+    from telemetry import setup_telemetry
+    setup_telemetry("postcare_api", app=app, db_engine=_engine)
+
 
 @app.on_event("startup")
 def on_startup() -> None:

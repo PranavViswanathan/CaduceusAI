@@ -17,6 +17,10 @@ CaduceusAI is a three-tier, local-first medical AI system. Every tier owns a ded
 ├─────────────────────────────────────────────────────────────────────┤
 │  SHARED INFRASTRUCTURE                                              │
 │  PostgreSQL :5432  |  Redis :6379  |  Ollama :11434                 │
+├─────────────────────────────────────────────────────────────────────┤
+│  OBSERVABILITY                                                      │
+│  OTel Collector :4318  |  Prometheus :9090                          │
+│  Grafana :3030          |  Jaeger :16686                            │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -105,6 +109,21 @@ graph TD
 
     DA <-->|X-Internal-Key| PCA
 
+    subgraph OBS["Observability"]
+        OC["otel-collector\n:4317/:4318\nOTLP receiver"]
+        PR["prometheus\n:9090"]
+        GF["grafana\n:3030"]
+        JG["jaeger\n:16686"]
+        OC -->|spanmetrics + metrics| PR
+        OC -->|traces| JG
+        PR -->|metrics datasource| GF
+        JG -->|trace datasource| GF
+    end
+
+    PA -->|OTLP/HTTP\nspans + metrics| OC
+    DA -->|OTLP/HTTP\nspans + metrics| OC
+    PCA -->|OTLP/HTTP\nspans + metrics| OC
+
     style T1 fill:transparent,stroke:#1D9E75,stroke-width:1.5px,stroke-dasharray:5 4
     style T2 fill:transparent,stroke:#7F77DD,stroke-width:1.5px,stroke-dasharray:5 4
     style T3 fill:transparent,stroke:#5DCAA5,stroke-width:1.5px,stroke-dasharray:5 4
@@ -112,6 +131,7 @@ graph TD
     style FALLBACK fill:transparent,stroke:#BA7517,stroke-width:1.5px,stroke-dasharray:5 4
     style RETRAIN fill:transparent,stroke:#D85A30,stroke-width:1.5px,stroke-dasharray:5 4
     style AGENT fill:transparent,stroke:#2D7DD2,stroke-width:1.5px,stroke-dasharray:5 4
+    style OBS fill:transparent,stroke:#E040FB,stroke-width:1.5px,stroke-dasharray:5 4
 ```
 
 ---
@@ -121,6 +141,11 @@ graph TD
 ```
 medical-ai-platform/
 ├── docker-compose.yml              # Full stack orchestration (local)
+├── otel-collector-config.yaml      # OTel Collector: OTLP → spanmetrics → Prometheus + Jaeger
+├── prometheus.yml                  # Scrape config (targets: otel-collector:8889)
+├── grafana/
+│   ├── provisioning/               # Auto-provisioned datasources + dashboard provider
+│   └── dashboards/medical-ai.json  # 9-panel Medical AI Platform dashboard
 ├── .env.example                    # Configuration template
 ├── alembic.ini                     # Alembic configuration
 ├── alembic/
@@ -131,9 +156,15 @@ medical-ai-platform/
 │   └── init.sql                    # PostgreSQL extension bootstrap
 ├── services/
 │   ├── patient_api/                # Tier 1 backend  (port 8001)
+│   │   └── telemetry.py            # OTel SDK init (FastAPI + SQLAlchemy + Redis + HTTPX)
 │   ├── doctor_api/                 # Tier 2 backend  (port 8002)
+│   │   ├── telemetry.py            # OTel SDK init
+│   │   ├── llm.py                  # Manual spans: ollama.risk_assessment; custom metrics
 │   │   └── agent/                  # LangGraph orchestration layer
+│   │       └── nodes.py            # Per-node spans: agent.{triage,rag,reasoning,...}
 │   └── postcare_api/               # Tier 3 backend  (port 8003)
+│       ├── telemetry.py            # OTel SDK init
+│       └── llm.py                  # Manual spans: ollama.care_plan, ollama.urgency_assessment
 ├── frontend/
 │   ├── patient_portal/             # Tier 1 UI  (port 3000)
 │   └── doctor_portal/              # Tier 2 UI  (port 3001)
@@ -178,6 +209,10 @@ medical-ai-platform/
 | `ollama-init` | — | One-shot: pulls llama3 + mistral into shared `ollama_data` volume |
 | `migrate` | — | One-shot: runs `alembic upgrade head` before APIs start |
 | `retrain-worker` | — | Continuous: polls buffer, runs PEFT LoRA training, registers fine-tuned model with Ollama |
+| `otel-collector` | 4317/4318 | Receives OTLP spans + metrics; spanmetrics connector → Prometheus; forwards traces to Jaeger |
+| `prometheus` | 9090 | Scrapes `otel-collector:8889` every 15 s; retains time-series for Grafana |
+| `grafana` | 3030 | Pre-provisioned dashboards (Prometheus + Jaeger datasources; credentials admin/admin) |
+| `jaeger` | 16686 | Distributed trace store and query UI |
 
 ---
 
@@ -340,9 +375,13 @@ doctor-api  (on next risk assessment request)
 ```
 postgres  ──(healthy)──┐
                        ├──→  migrate ──(completed)──┐
-redis     ──(healthy)──┘                            ├──→  patient-api
-                                                    ├──→  doctor-api
+redis     ──(healthy)──┘                            │
+                                                    ├──→  patient-api
+jaeger ──────────────────→  otel-collector ─────────┤
+(started)                   (started)               ├──→  doctor-api
                                                     └──→  postcare-api
+
+otel-collector ──(started)──→  prometheus ──(started)──→  grafana
 
 ollama ──(healthy)──→  ollama-init  (pulls llama3 + mistral; runs once)
 
@@ -559,6 +598,7 @@ In production (behind the ALB), all three API services share the same domain and
 | `LORA_LR` | retrain-worker | Learning rate. Default: `2e-4` |
 | `CORS_ORIGINS` | all APIs | Comma-separated list of allowed CORS origins. Default: `http://localhost:3000,http://localhost:3001`. Set to real frontend URLs in production. |
 | `COOKIE_DOMAIN` | all APIs | `Domain` attribute for session cookies. Default: `localhost`. Set to your domain (e.g. `api.example.com`) or leave blank in production to resolve to the request host. |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | all APIs | OTLP/HTTP base URL for traces and metrics. Default: `http://otel-collector:4318`. Set in `docker-compose.yml`; override for a remote collector in AWS. |
 | `NEXT_PUBLIC_PATIENT_API_URL` | patient-portal | Browser-visible patient API base URL |
 | `NEXT_PUBLIC_DOCTOR_API_URL` | doctor-portal | Browser-visible doctor API base URL |
 | `NEXT_PUBLIC_POSTCARE_API_URL` | both portals | Browser-visible postcare API base URL |
@@ -584,6 +624,7 @@ In AWS, all secret values (`JWT_SECRET`, `FERNET_KEY`, `INTERNAL_API_KEY`, `DATA
 | Missing `X-Internal-Key` | HTTP 403 `Forbidden` |
 | Rate limit exceeded | HTTP 429 `Too Many Requests` |
 | ECS task crash | ECS restarts the task automatically; ALB removes it from rotation until healthy |
+| OTel Collector down | API services continue serving; `BatchSpanProcessor` buffers spans in memory and retries export; metrics gap appears in Prometheus/Grafana until collector recovers |
 | RDS failover (AWS Multi-AZ) | Automatic failover in ~60–120 s; `DATABASE_URL` remains unchanged (CNAME-based) |
 | ElastiCache replica failure (AWS) | Automatic failover to replica promoted to primary |
 | Ollama EC2 stop/restart | Models are retained on the EBS volume; Ollama starts automatically via systemd |

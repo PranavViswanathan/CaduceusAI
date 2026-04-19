@@ -1,13 +1,27 @@
 import json
 import logging
 import re
+import time
 
 import httpx
 import redis as redis_lib
+from opentelemetry import metrics, trace
 
 from settings import settings
 
 logger = logging.getLogger(__name__)
+
+tracer = trace.get_tracer(__name__)
+_meter = metrics.get_meter(__name__)
+_ollama_duration = _meter.create_histogram(
+    "ollama.request.duration",
+    unit="s",
+    description="Duration of Ollama LLM inference calls",
+)
+_ollama_fallback = _meter.create_counter(
+    "ollama.fallback",
+    description="Times rule-based fallback was used instead of Ollama",
+)
 
 _DANGEROUS_COMBOS = [
     {
@@ -89,12 +103,10 @@ def _build_prompt(patient_data: dict) -> str:
 
 def _parse_llm_json(raw: str) -> dict:
     raw = raw.strip()
-    # Extract the first {...} block
     json_match = re.search(r"\{.*?\}", raw, re.DOTALL)
     if not json_match:
         json_match = re.search(r"\{.*\}", raw, re.DOTALL)
     candidate = json_match.group() if json_match else raw
-    # Remove control characters that break JSON parsing
     candidate = re.sub(r"[\x00-\x1f\x7f]", lambda m: " " if m.group() in "\t\n\r" else "", candidate)
     try:
         return json.loads(candidate)
@@ -137,7 +149,6 @@ def _model_priority_list() -> list[str]:
             seen.add(c)
             unique.append(c)
 
-    # Match by base name so tagged names like "medical-risk-ft:latest" resolve correctly
     def is_available(model: str) -> bool:
         return model.split(":")[0] in available
 
@@ -147,29 +158,42 @@ def _model_priority_list() -> list[str]:
 async def get_risk_assessment(patient_data: dict) -> dict:
     prompt = _build_prompt(patient_data)
     models = _model_priority_list()
+    attrs = {"ollama.operation": "risk_assessment"}
 
-    for model in models:
-        try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                resp = await client.post(
-                    f"{settings.OLLAMA_URL}/api/generate",
-                    json={"model": model, "prompt": prompt, "stream": False},
-                )
-                resp.raise_for_status()
-                raw_text = resp.json().get("response", "")
-                parsed = _parse_llm_json(raw_text)
-                if "risks" not in parsed or "confidence" not in parsed or "summary" not in parsed:
-                    raise ValueError("Missing required fields in LLM response")
-                parsed["source"] = f"llm:{model}"
-                return parsed
-        except httpx.ConnectError:
-            logger.warning("Ollama not reachable, skipping model %s", model)
-            break
-        except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
-            logger.warning("Ollama request failed (model=%s): %s", model, exc)
-            continue
-        except (json.JSONDecodeError, ValueError, KeyError) as exc:
-            logger.warning("LLM response parse error (model=%s): %s", model, exc)
-            continue
+    with tracer.start_as_current_span("ollama.risk_assessment") as span:
+        span.set_attribute("ollama.operation", "risk_assessment")
+        span.set_attribute("ollama.model_count", len(models))
 
-    return rule_based_assessment(patient_data)
+        for model in models:
+            t0 = time.perf_counter()
+            try:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    resp = await client.post(
+                        f"{settings.OLLAMA_URL}/api/generate",
+                        json={"model": model, "prompt": prompt, "stream": False},
+                    )
+                    resp.raise_for_status()
+                    raw_text = resp.json().get("response", "")
+                    parsed = _parse_llm_json(raw_text)
+                    if "risks" not in parsed or "confidence" not in parsed or "summary" not in parsed:
+                        raise ValueError("Missing required fields in LLM response")
+                    _ollama_duration.record(
+                        time.perf_counter() - t0,
+                        attributes={**attrs, "ollama.model": model},
+                    )
+                    parsed["source"] = f"llm:{model}"
+                    span.set_attribute("ollama.model", model)
+                    return parsed
+            except httpx.ConnectError:
+                logger.warning("Ollama not reachable, skipping model %s", model)
+                break
+            except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
+                logger.warning("Ollama request failed (model=%s): %s", model, exc)
+                continue
+            except (json.JSONDecodeError, ValueError, KeyError) as exc:
+                logger.warning("LLM response parse error (model=%s): %s", model, exc)
+                continue
+
+        _ollama_fallback.add(1, attributes=attrs)
+        span.set_attribute("ollama.fallback", True)
+        return rule_based_assessment(patient_data)

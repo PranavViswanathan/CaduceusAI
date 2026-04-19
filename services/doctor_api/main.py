@@ -50,6 +50,11 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 RETRAIN_BUFFER = Path("/app/data/retrain_buffer.jsonl")
 router = APIRouter(prefix="/v1")
 
+if not _TESTING:
+    from database import engine as _engine
+    from telemetry import setup_telemetry
+    setup_telemetry("doctor_api", app=app, db_engine=_engine)
+
 
 @app.on_event("startup")
 def on_startup() -> None:

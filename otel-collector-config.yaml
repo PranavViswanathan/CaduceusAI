@@ -1,0 +1,49 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 10s
+    send_batch_size: 512
+
+connectors:
+  spanmetrics:
+    histogram:
+      explicit:
+        buckets: [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000, 30000, 120000]
+    dimensions:
+      - name: service.name
+      - name: db.system
+      - name: db.operation
+      - name: ollama.model
+      - name: ollama.operation
+      - name: agent.node
+      - name: http.method
+      - name: http.route
+      - name: http.status_code
+    metrics_flush_interval: 15s
+
+exporters:
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+    namespace: medical_ai
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/jaeger, spanmetrics]
+    metrics:
+      receivers: [otlp, spanmetrics]
+      processors: [batch]
+      exporters: [prometheus]

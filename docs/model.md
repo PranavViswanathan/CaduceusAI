@@ -577,3 +577,42 @@ For production workloads with many concurrent doctors, consider:
 - Upgrading to `g4dn.2xlarge` or `g4dn.12xlarge` for more VRAM (set `ollama_instance_type` in `terraform.tfvars`)
 - Running multiple Ollama instances behind an internal load balancer
 - Moving to a managed inference endpoint (AWS Bedrock) if data-residency requirements allow it — this would require changes to `llm.py`
+
+---
+
+## Observability
+
+All Ollama calls and LangGraph agent nodes are instrumented with **OpenTelemetry**. Spans and metrics are exported via OTLP/HTTP to the OTel Collector, which forwards traces to Jaeger and exposes metrics to Prometheus (scraped by Grafana).
+
+### Span reference
+
+| Function / Node | Span name | Key attributes |
+|---|---|---|
+| `get_risk_assessment()` | `ollama.risk_assessment` | `ollama.operation`, `ollama.model`, `ollama.model_count`, `ollama.fallback` |
+| `generate_care_plan()` | `ollama.care_plan` | `ollama.operation`, `ollama.model`, `ollama.fallback` |
+| `assess_checkin_urgency()` | `ollama.urgency_assessment` | `ollama.operation`, `ollama.model`, `ollama.fallback` |
+| `triage_node` | `agent.triage` | `agent.node`, `agent.query_type` |
+| `rag_node` | `agent.rag` | `agent.node`, `agent.docs_retrieved`, `agent.confidence` |
+| `reasoning_node` | `agent.reasoning` | `agent.node`, `agent.confidence` |
+| `escalation_node` | `agent.escalation` | `agent.node`, `agent.query_type`, `agent.outcome` |
+| `retraining_trigger_node` | `agent.retraining_trigger` | `agent.node`, `agent.retrain_enqueued` |
+
+All Ollama HTTP calls also produce a child `HTTP POST` span from HTTPX auto-instrumentation. The parent custom span provides the clinical context (which operation the call serves); the child span provides raw HTTP timing and status.
+
+### Prometheus metrics
+
+| Metric | Type | Description |
+|---|---|---|
+| `medical_ai_ollama_request_duration_seconds` | Histogram | Wall-clock time from sending the Ollama POST to receiving a valid parsed response, labelled by `ollama_model` and `ollama_operation` |
+| `medical_ai_ollama_fallback_total` | Counter | Incremented each time a rule-based fallback is used instead of Ollama, labelled by `ollama_operation` |
+| `medical_ai_agent_node_duration_seconds` | Histogram | End-to-end duration of each LangGraph node including any Ollama call it makes, labelled by `agent_node` |
+
+The OTel Collector's `spanmetrics` connector additionally derives `medical_ai_traces_spanmetrics_calls_total` and `medical_ai_traces_spanmetrics_duration_milliseconds` from every span — covering DB queries, Redis commands, and HTTP routes without any additional instrumentation code.
+
+### Viewing traces
+
+Open Jaeger at **http://localhost:16686** and select service `doctor_api` or `postcare_api`. Each agent query produces a trace with the full node execution chain visible as nested spans. The `ollama.fallback = true` attribute on a span indicates the LLM was unavailable and the rule-based path was taken.
+
+### Viewing metrics
+
+Open Grafana at **http://localhost:3030** (admin / admin) → **Medical AI Platform** dashboard. The *Ollama Inference Duration* panel shows p50 and p95 latency per operation, and the *Ollama Fallback Rate* panel shows how often the rule engine activates — a sustained non-zero rate indicates Ollama connectivity issues.
