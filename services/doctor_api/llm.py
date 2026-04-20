@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 import time
 
@@ -8,6 +9,22 @@ import redis as redis_lib
 from opentelemetry import metrics, trace
 
 from settings import settings
+
+_DEMO_MODE = os.getenv("DEMO_MODE", "").lower() == "true"
+
+_DEMO_RISK_ASSESSMENT = {
+    "risks": [
+        "Warfarin combined with ibuprofen significantly raises bleeding risk (demo).",
+        "Lisinopril may cause hyperkalemia when combined with potassium supplements (demo).",
+        "Blood pressure medications require regular monitoring every 3–6 months (demo).",
+    ],
+    "confidence": "medium",
+    "summary": (
+        "Demo mode: pre-scripted risk assessment. "
+        "Run 'make start' instead of 'make demo' to enable real AI analysis."
+    ),
+    "source": "demo",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +173,9 @@ def _model_priority_list() -> list[str]:
 
 
 async def get_risk_assessment(patient_data: dict) -> dict:
+    if _DEMO_MODE:
+        return _DEMO_RISK_ASSESSMENT.copy()
+
     prompt = _build_prompt(patient_data)
     models = _model_priority_list()
     attrs = {"ollama.operation": "risk_assessment"}

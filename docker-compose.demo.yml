@@ -1,0 +1,50 @@
+# Demo mode override — use with: make demo
+# Stubs out Ollama and model downloads; all LLM calls return pre-scripted responses.
+# Merge command: docker compose -f docker-compose.yml -f docker-compose.demo.yml up --build -d
+
+services:
+  # API services: skip Ollama calls and return canned demo responses
+  patient-api:
+    environment:
+      DEMO_MODE: "true"
+
+  doctor-api:
+    environment:
+      DEMO_MODE: "true"
+
+  postcare-api:
+    environment:
+      DEMO_MODE: "true"
+
+  # Frontends: show demo banner via server-side DEMO_MODE env var
+  patient-portal:
+    environment:
+      DEMO_MODE: "true"
+
+  doctor-portal:
+    environment:
+      DEMO_MODE: "true"
+
+  # Ollama stub — passes healthcheck immediately so dependent services start,
+  # but the daemon is never running (API services skip it entirely in demo mode)
+  ollama:
+    entrypoint: ["sh", "-c", "sleep infinity"]
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 1s
+      timeout: 1s
+      retries: 1
+      start_period: 1s
+
+  # Skip model downloads — override image so we never build/tag as ollama/ollama
+  ollama-init:
+    image: python:3.11-slim
+    entrypoint: ["sh", "-c", "echo 'Demo mode: skipping model downloads'"]
+    restart: "no"
+
+  # Disable retrain worker — use stub image to skip the heavy torch/llama.cpp build
+  retrain-worker:
+    build:
+      context: ./docker/demo-stub
+    entrypoint: ["sh", "-c", "echo 'Demo mode: retrain worker disabled'"]
+    restart: "no"

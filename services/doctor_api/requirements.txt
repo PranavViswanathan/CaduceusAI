@@ -5,7 +5,7 @@ psycopg2-binary==2.9.9
 redis==5.0.4
 python-jose[cryptography]==3.3.0
 passlib[bcrypt]==1.7.4
-bcrypt==3.2.2
+bcrypt==4.0.1
 cryptography==42.0.5
 pydantic==2.7.1
 pydantic-settings==2.2.1
@@ -22,5 +22,5 @@ opentelemetry-instrumentation-sqlalchemy==0.45b0
 opentelemetry-instrumentation-redis==0.45b0
 opentelemetry-instrumentation-httpx==0.45b0
 langgraph==0.2.55
-langchain-core==0.2.40
+langchain-core==0.2.43
 chromadb==0.5.23

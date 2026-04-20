@@ -1,13 +1,61 @@
 SHELL := /usr/bin/env bash
 .SHELLFLAGS := -euo pipefail -c
 
-.PHONY: start stop health configure help
+.PHONY: start stop health configure demo help
 
 .DEFAULT_GOAL := help
 
 help: ## Show available targets
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
 	  awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}'
+
+demo: ## Start in demo mode — no Ollama or model downloads; AI responses are pre-scripted
+	@if [ ! -f .env ]; then \
+	  echo "ERROR: .env not found. Copy .env.example and fill in the values."; \
+	  exit 1; \
+	fi
+	@printf '\n'
+	@printf '\033[0;33m╔════════════════════════════════════════════════════════════════╗\033[0m\n'
+	@printf '\033[0;33m║               ⚠   D E M O   M O D E   A C T I V E   ⚠         ║\033[0m\n'
+	@printf '\033[0;33m╠════════════════════════════════════════════════════════════════╣\033[0m\n'
+	@printf '\033[0;33m║  Ollama and LLM models are NOT started.                        ║\033[0m\n'
+	@printf '\033[0;33m║  All AI responses are pre-scripted demo data.                  ║\033[0m\n'
+	@printf '\033[0;33m║  No large model downloads required (~0 MB vs ~8+ GB).          ║\033[0m\n'
+	@printf '\033[0;33m║                                                                ║\033[0m\n'
+	@printf '\033[0;33m║  To switch to FULL AI (requires Ollama + llama3/mistral):      ║\033[0m\n'
+	@printf '\033[0;33m║    make stop && make start                                     ║\033[0m\n'
+	@printf '\033[0;33m╚════════════════════════════════════════════════════════════════╝\033[0m\n'
+	@printf '\n'
+	@echo "==> Building and starting demo stack..."
+	docker compose -f docker-compose.yml -f docker-compose.demo.yml up --build -d
+	@echo ""; \
+	echo "==> Waiting for APIs to be ready..."; \
+	_wait_for() { \
+	  local name=$$1 url=$$2; \
+	  local attempts=0; \
+	  until curl -sf "$$url" > /dev/null 2>&1; do \
+	    attempts=$$((attempts + 1)); \
+	    if [ $$attempts -ge 30 ]; then \
+	      echo "  TIMEOUT: $$name did not become ready in time."; \
+	      return 1; \
+	    fi; \
+	    sleep 2; \
+	  done; \
+	  echo "  OK  $$name"; \
+	}; \
+	_wait_for "patient-api"  "http://localhost:8001/health"; \
+	_wait_for "doctor-api"   "http://localhost:8002/health"; \
+	_wait_for "postcare-api" "http://localhost:8003/health"; \
+	echo ""; \
+	echo "==> Demo stack is up."; \
+	echo ""; \
+	echo "  Patient Portal    http://localhost:3000  (demo banner visible)"; \
+	echo "  Doctor Dashboard  http://localhost:3001  (demo banner visible)"; \
+	echo "  Patient API docs  http://localhost:8001/docs"; \
+	echo "  Doctor API docs   http://localhost:8002/docs"; \
+	echo "  PostCare API docs http://localhost:8003/docs"; \
+	echo ""; \
+	echo "  NOTE: AI responses are pre-scripted. Run 'make stop && make start' for full AI."
 
 start: ## Build and start all services, then wait for APIs to be ready
 	@if [ ! -f .env ]; then \

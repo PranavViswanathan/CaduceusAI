@@ -46,6 +46,7 @@ graph TD
         PG[("PostgreSQL\n:5432")]
         RD[("Redis\n:6379")]
         OL["Ollama\n:11434\nllama3 / mistral"]
+        DPA[("doctor_patient\n_assignments")]
     end
 
     subgraph FALLBACK["Fallbacks"]
@@ -65,6 +66,8 @@ graph TD
 
     PA -->|write intake + audit| PG
     DA -->|read intake, write risk + feedback| PG
+    DA -->|upsert / delete assignment rows| DPA
+    DPA -->|assert assigned before risk/feedback| DA
     PCA -->|write care plans + checkins| PG
 
     DA <-->|cache risk TTL 5m| RD
@@ -141,6 +144,10 @@ graph TD
 ```
 medical-ai-platform/
 ├── docker-compose.yml              # Full stack orchestration (local)
+├── docker-compose.demo.yml         # Demo mode overlay (make demo): stubs Ollama/retrain-worker, sets DEMO_MODE=true
+├── docker/
+│   └── demo-stub/
+│       └── Dockerfile              # Minimal FROM python:3.11-slim stub used by demo overlay for fast builds
 ├── otel-collector-config.yaml      # OTel Collector: OTLP → spanmetrics → Prometheus + Jaeger
 ├── prometheus.yml                  # Scrape config (targets: otel-collector:8889)
 ├── grafana/
@@ -629,6 +636,7 @@ In production (behind the ALB), all three API services share the same domain and
 | `NEXT_PUBLIC_PATIENT_API_URL` | patient-portal | Browser-visible patient API base URL |
 | `NEXT_PUBLIC_DOCTOR_API_URL` | doctor-portal | Browser-visible doctor API base URL |
 | `NEXT_PUBLIC_POSTCARE_API_URL` | both portals | Browser-visible postcare API base URL |
+| `DEMO_MODE` | all APIs, both portals | When `true`, all LLM calls return pre-scripted canned responses; Ollama is not required. Set automatically by `make demo` via `docker-compose.demo.yml`. |
 
 In AWS, all secret values (`JWT_SECRET`, `FERNET_KEY`, `INTERNAL_API_KEY`, `DATABASE_URL` password) are stored in AWS Secrets Manager and injected into ECS tasks at runtime via the execution role.
 

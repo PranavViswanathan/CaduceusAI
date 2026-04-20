@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import re
 import time
 from datetime import datetime, timedelta
@@ -8,6 +9,32 @@ import httpx
 from opentelemetry import metrics, trace
 
 from settings import settings
+
+_DEMO_MODE = os.getenv("DEMO_MODE", "").lower() == "true"
+
+_DEMO_CARE_PLAN = {
+    "follow_up_date": None,  # set at call time so relative dates stay fresh
+    "medications_to_monitor": [
+        "Lisinopril 10 mg — check BP weekly (demo)",
+        "Metformin 500 mg — check fasting glucose at follow-up (demo)",
+    ],
+    "lifestyle_recommendations": [
+        "Low-sodium diet (< 2 g/day) (demo)",
+        "30 minutes moderate exercise 5 days/week (demo)",
+        "Maintain regular sleep schedule 7–9 hours (demo)",
+    ],
+    "warning_signs": [
+        "Chest pain or tightness (demo)",
+        "Shortness of breath at rest (demo)",
+        "Fever above 101°F (38.3°C) (demo)",
+        "Sudden severe headache (demo)",
+    ],
+}
+
+_DEMO_URGENCY_ROUTINE = {
+    "urgency": "routine",
+    "reason": "Demo mode: pre-scripted triage — no urgent keywords detected. Run 'make start' for real AI triage.",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +89,11 @@ def _parse_json_response(raw: str) -> dict:
 
 
 async def generate_care_plan(patient_id: str, visit_notes: str) -> dict:
+    if _DEMO_MODE:
+        plan = _DEMO_CARE_PLAN.copy()
+        plan["follow_up_date"] = (datetime.utcnow() + timedelta(days=14)).date().isoformat()
+        return plan
+
     follow_up = (datetime.utcnow() + timedelta(days=14)).date().isoformat()
     prompt = (
         "You are a clinical care coordinator. Based on the visit notes below, generate a structured "
@@ -115,6 +147,16 @@ def _rule_based_urgency(symptom_report: str) -> dict:
 
 
 async def assess_checkin_urgency(symptom_report: str, care_plan: dict) -> dict:
+    if _DEMO_MODE:
+        report_lower = symptom_report.lower()
+        escalate_keywords = ["chest pain", "can't breathe", "shortness of breath", "unconscious", "stroke"]
+        if any(kw in report_lower for kw in escalate_keywords):
+            return {
+                "urgency": "escalate",
+                "reason": "Demo mode: critical keyword detected — escalated to clinician. Run 'make start' for real AI triage.",
+            }
+        return _DEMO_URGENCY_ROUTINE.copy()
+
     warning_signs = care_plan.get("warning_signs", [])
     prompt = (
         "You are a triage nurse. Given the patient's care plan warning signs and their symptom report, "
