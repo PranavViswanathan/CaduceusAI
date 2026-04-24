@@ -39,6 +39,9 @@ The stack runs as a Docker Compose application with dependency-ordered startup, 
 │  SHARED INFRASTRUCTURE                                      │
 │  PostgreSQL :5432 | Redis :6379 | Ollama :11434             │
 ├─────────────────────────────────────────────────────────────┤
+│  ML INFRASTRUCTURE                                          │
+│  MLflow :5001 (experiment tracking + model registry)        │
+├─────────────────────────────────────────────────────────────┤
 │  OBSERVABILITY                                              │
 │  OTel Collector :4318 | Prometheus :9090                    │
 │  Grafana :3030          | Jaeger :16686                     │
@@ -70,7 +73,8 @@ The stack runs as a Docker Compose application with dependency-ordered startup, 
 | `ollama` | 11434 | Local LLM inference (llama3 / mistral / medical-risk-ft) |
 | `ollama-init` | — | One-shot service that pulls llama3 + mistral on first boot |
 | `migrate` | — | One-shot service that runs Alembic migrations before APIs start |
-| `retrain-worker` | — | Continuous PEFT LoRA training loop; registers fine-tuned model with Ollama |
+| `retrain-worker` | — | Continuous PEFT LoRA training loop; registers fine-tuned model with Ollama; logs runs to MLflow |
+| `mlflow` | 5001 | MLflow tracking server — experiment logs, metrics, artifacts, and model registry for fine-tuned models |
 | `otel-collector` | 4317/4318 | Receives OTLP spans + metrics from all APIs; converts traces → metrics via spanmetrics connector |
 | `prometheus` | 9090 | Scrapes metrics endpoint from OTel Collector every 15 s |
 | `grafana` | 3030 | Pre-provisioned dashboards over Prometheus metrics and Jaeger traces (admin / admin) |
@@ -124,9 +128,10 @@ Docker Compose handles the complete startup sequence automatically:
 1. **postgres** and **redis** start and pass health checks
 2. **migrate** runs `alembic upgrade head` to apply all schema migrations
 3. **ollama** starts; **ollama-init** pulls `llama3` and `mistral` (~4.7 GB + ~4.1 GB on first run — this may take several minutes). If `ollama-init` is slow or fails, models can be pulled manually (see Troubleshooting below).
-4. All three API services start once `migrate` completes
-5. Both frontend portals start
-6. **retrain-worker** starts and begins polling for feedback data (depends on postgres, redis, and ollama being healthy)
+4. **mlflow** starts and passes its health check (SQLite backend, exposes UI on `:5001`)
+5. All three API services start once `migrate` completes
+6. Both frontend portals start
+7. **retrain-worker** starts and begins polling for feedback data (depends on postgres, redis, ollama, and mlflow being healthy)
 
 Model weights are stored in Docker volumes (`ollama_data`, `hf_cache`, `model_artifacts`) and are only downloaded/trained once. The first LoRA training run also downloads the `TinyLlama-1.1B` base model from HuggingFace (~2.2 GB).
 
@@ -150,6 +155,7 @@ docker compose down -v  # stop and delete all data volumes
 | Grafana dashboards | http://localhost:3030 (admin / admin) |
 | Prometheus | http://localhost:9090 |
 | Jaeger traces | http://localhost:16686 |
+| MLflow UI | http://localhost:5001 |
 
 ### 4. Bootstrap a doctor account
 
@@ -318,6 +324,7 @@ The `retrain-worker` service runs a continuous polling loop that automatically f
    - Fine-tunes `TinyLlama-1.1B` with PEFT LoRA (CPU, ~2 epochs)
    - Merges the adapter and converts to GGUF via llama.cpp
    - Registers `medical-risk-ft:latest` with Ollama
+   - Logs the run to MLflow (params, metrics, artifacts) and transitions the registered model to `Production` in the MLflow model registry
 5. `doctor-api` automatically prefers `medical-risk-ft` over `llama3` / `mistral` once it is registered
 
 **Check training status:**
@@ -464,7 +471,9 @@ medical-ai-platform/
 │       └── src/app/
 │           ├── login/page.tsx
 │           ├── patients/page.tsx
-│           └── patients/[id]/page.tsx
+│           ├── patients/[id]/page.tsx
+│           ├── escalations/page.tsx    # Agent escalation queue
+│           └── agent/page.tsx          # LangGraph clinical agent chat
 ├── terraform/                          # AWS infrastructure (Terraform)
 │   ├── main.tf                         # Provider + backend config
 │   ├── variables.tf                    # All input variables

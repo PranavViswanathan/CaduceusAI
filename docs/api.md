@@ -279,7 +279,9 @@ Remove the assignment between the authenticated doctor and a patient.
 
 Retrieve (or generate) an AI risk assessment for a patient.
 
-Flow: check Redis cache → call Ollama → fall back to rule-based → store + cache result.
+Flow: check Redis cache → check existing DB record → call Ollama → fall back to rule-based → store + cache result.
+
+If a `RiskAssessment` row already exists for this patient (cache miss but DB hit), the stored result is returned immediately and cached — no new LLM call is made. A new LLM call only occurs the first time a patient's risk is requested, or after feedback invalidates the cache and all stored assessments are cleared.
 
 **Response** `200`:
 ```json
@@ -419,6 +421,40 @@ Submit a clinical query to the five-node LangGraph agent. The agent automaticall
 - `urgent` → escalated immediately
 
 **Error** `503`: Agent temporarily unavailable (graph execution failure).
+
+---
+
+#### `GET /v1/agent/escalations`
+
+Returns all unacknowledged agent escalations for the authenticated doctor's assigned patients. Queries encrypted from `AgentEscalation` rows are decrypted before being returned.
+
+**Response** `200`:
+```json
+[
+  {
+    "id": "<uuid>",
+    "patient_id": "<uuid>",
+    "patient_name": "Jane Doe",
+    "query": "Patient is having chest tightness and shortness of breath",
+    "query_type": "urgent",
+    "reason": "Urgent symptom keywords detected",
+    "created_at": "2026-04-20T14:32:00Z"
+  }
+]
+```
+
+---
+
+#### `POST /v1/agent/escalations/{id}/acknowledge`
+
+Mark an agent escalation as acknowledged. The escalation is removed from all subsequent `GET /v1/agent/escalations` responses.
+
+**Response** `200`:
+```json
+{ "id": "<uuid>", "acknowledged": true }
+```
+
+**Error** `404`: Escalation not found or not assigned to this doctor's patients.
 
 ---
 

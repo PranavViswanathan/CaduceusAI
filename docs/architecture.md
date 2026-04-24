@@ -64,13 +64,20 @@ graph TD
         OLF["medical-risk-ft\nOllama model"]
     end
 
+    subgraph MLINFRA["ML Infrastructure"]
+        MLF["mlflow\n:5001\nexperiment tracking\n+ model registry"]
+    end
+
     PA -->|write intake + audit| PG
     DA -->|read intake, write risk + feedback| PG
     DA -->|upsert / delete assignment rows| DPA
     DPA -->|assert assigned before risk/feedback| DA
     PCA -->|write care plans + checkins| PG
 
-    DA <-->|cache risk TTL 5m| RD
+    DA -->|1 Redis cache check\nrisk TTL 5m| RD
+    RD -->|cache miss| DA
+    DA -->|2 DB fallback on miss\nreturn existing row| PG
+    PG -->|DB hit → re-cache| RD
     PCA <-->|escalation_queue| RD
     DA -->|RPUSH on override/flag| RQ
     RQ -->|LPOP drain| RB2
@@ -78,15 +85,18 @@ graph TD
     RS -->|PEFT LoRA train + GGUF| OLF
     RS --> RL
     RS --> MR
+    RS -->|log params + metrics\n+ artifacts| MLF
+    MLF -->|transition to Production| OLF
     OLF -->|medical-risk-ft preferred| DA
 
     subgraph AGENT["LangGraph Agent (doctor-api)"]
-        TN["triage_node"]
-        RAN["rag_node"]
-        REN["reasoning_node"]
-        EN["escalation_node"]
-        RT["retraining_trigger_node"]
+        TN["triage_node\n① rule regex\n② Ollama LLM"]
+        RAN["rag_node\nChromaDB + Ollama\nnum_predict 350"]
+        REN["reasoning_node\nCoT + Ollama\nnum_predict 500"]
+        EN["escalation_node\nPHI-encrypt → DB"]
+        RT["retraining_trigger_node\nfeedback_score check"]
         AE[("agent_escalations\nPHI-encrypted")]
+        AC[("agent response\ncache Redis 5m")]
         TN -->|routine| RAN
         TN -->|complex| REN
         TN -->|urgent| EN
@@ -94,6 +104,7 @@ graph TD
         REN -->|conf<0.5| EN
         RAN --> RT
         EN --> AE
+        RT -->|non-escalation hit| AC
     end
 
     DA <-->|/v1/agent/query| AGENT
@@ -101,13 +112,16 @@ graph TD
     AGENT -->|retrain_queue lpush| RD
     AGENT -->|triage + RAG + CoT prompts| OL
 
-    DA -->|risk prompt| OL
+    DP -->|GET /v1/agent/escalations\n/escalations page| DA
+    DA -->|decrypt + list| AE
+
+    DA -->|risk prompt\n(only on first req\nor after feedback)| OL
     PCA -->|care plan + urgency prompt| OL
     OL -->|unavailable| RB
     OL -->|unavailable| KW
     OL -->|unavailable| ST
 
-    DP -->|poll escalations every 60s| PCA
+    DP -->|poll check-in escalations\nevery 60s| PCA
     PP -->|read care plan| PCA
 
     DA <-->|X-Internal-Key| PCA
@@ -133,6 +147,7 @@ graph TD
     style INFRA fill:transparent,stroke:#888780,stroke-width:1.5px,stroke-dasharray:5 4
     style FALLBACK fill:transparent,stroke:#BA7517,stroke-width:1.5px,stroke-dasharray:5 4
     style RETRAIN fill:transparent,stroke:#D85A30,stroke-width:1.5px,stroke-dasharray:5 4
+    style MLINFRA fill:transparent,stroke:#F06292,stroke-width:1.5px,stroke-dasharray:5 4
     style AGENT fill:transparent,stroke:#2D7DD2,stroke-width:1.5px,stroke-dasharray:5 4
     style OBS fill:transparent,stroke:#E040FB,stroke-width:1.5px,stroke-dasharray:5 4
 ```
@@ -218,7 +233,8 @@ medical-ai-platform/
 | `ollama` | 11434 | Local LLM inference (llama3 / mistral / medical-risk-ft) |
 | `ollama-init` | — | One-shot: pulls llama3 + mistral into shared `ollama_data` volume |
 | `migrate` | — | One-shot: runs `alembic upgrade head` before APIs start |
-| `retrain-worker` | — | Continuous: polls buffer, runs PEFT LoRA training, registers fine-tuned model with Ollama |
+| `retrain-worker` | — | Continuous: polls buffer, runs PEFT LoRA training, registers fine-tuned model with Ollama; logs all runs to MLflow |
+| `mlflow` | 5001 | MLflow tracking server — experiment runs, metrics, artifact storage, and model registry with Production/Archived stage transitions |
 | `otel-collector` | 4317/4318 | Receives OTLP spans + metrics; spanmetrics connector → Prometheus; forwards traces to Jaeger |
 | `prometheus` | 9090 | Scrapes `otel-collector:8889` every 15 s; retains time-series for Grafana |
 | `grafana` | 3030 | Pre-provisioned dashboards (Prometheus + Jaeger datasources; credentials admin/admin) |
@@ -417,7 +433,8 @@ ollama ──(healthy)──→  ollama-init  (pulls llama3 + mistral; runs once
 
 postgres  ──(healthy)──┐
 redis     ──(healthy)──├──→  retrain-worker  (continuous polling loop)
-ollama    ──(healthy)──┘
+ollama    ──(healthy)──┤
+mlflow    ──(healthy)──┘
 
 patient-api  ──(started)──→  patient-portal
 doctor-api   ──(started)──→  doctor-portal
@@ -633,6 +650,7 @@ In production (behind the ALB), all three API services share the same domain and
 | `CHROMA_HOST` | doctor-api (agent) | Hostname for ChromaDB HTTP client. Default: `chroma`. Only used when `CHROMA_CLIENT_TYPE=http`. |
 | `CHROMA_PORT` | doctor-api (agent) | Port for ChromaDB HTTP client. Default: `8000`. Only used when `CHROMA_CLIENT_TYPE=http`. |
 | `RETRAIN_SCORE_THRESHOLD` | doctor-api (agent) | Agent feedback scores below this value trigger a retrain queue push. Default: `0.4`. |
+| `MLFLOW_TRACKING_URI` | retrain-worker | MLflow server URL. Default: `http://mlflow:5000` (Docker Compose). Set to `http://localhost:5001` for manual local runs. |
 | `NEXT_PUBLIC_PATIENT_API_URL` | patient-portal | Browser-visible patient API base URL |
 | `NEXT_PUBLIC_DOCTOR_API_URL` | doctor-portal | Browser-visible doctor API base URL |
 | `NEXT_PUBLIC_POSTCARE_API_URL` | both portals | Browser-visible postcare API base URL |
@@ -651,6 +669,7 @@ In AWS, all secret values (`JWT_SECRET`, `FERNET_KEY`, `INTERNAL_API_KEY`, `DATA
 | LoRA training failure | Buffer is preserved for retry; failure written to `retrain_log.jsonl` with `"status": "failed"` |
 | LoRA eval gate failure | Merged model did not pass all 5 clinical eval scenarios; Ollama registration skipped; buffer preserved for retry; logged with `"status": "eval_failed"` and `eval_pass_rate` |
 | GGUF conversion unavailable | Adapter and merged model saved in HuggingFace format; Ollama registration skipped; inference continues with base models |
+| MLflow server unavailable | Training proceeds normally; all MLflow calls are wrapped in try/except and fail silently with a warning log — the fine-tuned model is still registered with Ollama |
 | PostgreSQL down | HTTP 503, no stack traces in response body |
 | Redis down | Cache miss treated as no-op; queue pushes fail silently with a log warning |
 | PHI decryption failure | Field returns `None`; request continues |

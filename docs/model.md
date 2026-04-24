@@ -76,11 +76,16 @@ The fallback returns:
 
 If no known interactions are found, it returns a generic low-confidence warning.
 
-### Caching
+### Caching and DB-First Lookup
 
-Successful assessments are cached in Redis under key `risk:{patient_id}` with a 300-second TTL. Cache misses are treated as no-ops (the assessment is always recomputed on a miss; the cache is best-effort).
+On each request the handler checks **two** caches before calling Ollama:
 
-When a doctor submits feedback (`POST /v1/doctor/patients/{id}/feedback`), the cache key for that patient is **immediately deleted** (`redis.delete(f"risk:{patient_id}")`). This ensures the next risk request reflects the updated clinical context rather than serving a stale cached result.
+1. **Redis** — key `risk:{patient_id}`, TTL 300 s. A Redis hit returns instantly (~1 ms).
+2. **Database** — if the Redis key is absent, the most recent `RiskAssessment` row for the patient is queried. If found, it is returned and re-cached in Redis. This means Ollama is only called the **first time** a patient's risk is ever assessed; all subsequent page views return the stored result in ~10 ms regardless of Redis TTL expiry.
+
+A new Ollama call only happens after feedback explicitly invalidates the cache. When a doctor submits feedback (`POST /v1/doctor/patients/{id}/feedback`), the Redis key for that patient is **immediately deleted** (`redis.delete(f"risk:{patient_id}")`). This ensures the next risk request reflects the updated clinical context rather than serving a stale cached result.
+
+The `version` counter on `RiskAssessment` rows still increments on each genuinely new LLM call, preserving the full assessment history for retraining reference.
 
 ---
 
@@ -311,6 +316,7 @@ The pipeline only proceeds once the buffer reaches `MIN_RETRAIN_BATCH` items (de
 | Step | What happens |
 |---|---|
 | **Batch check** | Exits early if `len(buffer) < MIN_RETRAIN_BATCH` |
+| **MLflow run start** | Opens an MLflow run in the `medical-risk-ft` experiment (creates the experiment on first run). All subsequent steps log into this run. MLflow calls are wrapped in try/except — if the server is unavailable, training proceeds without logging. |
 | **Dataset construction** | For each buffer item, queries `risk_assessments` and `patient_intake` tables via `assessment_id`. Builds an Alpaca-format `{instruction, input, output}` example. `override` feedback uses the doctor's reason as the corrected `summary`; `flag` feedback appends a clinical note to the original assessment. Malformed JSONL lines are skipped with a warning rather than crashing. |
 | **LoRA training** | Loads `TinyLlama/TinyLlama-1.1B-Chat-v1.0` from HuggingFace (cached in `hf_cache` Docker volume). Applies PEFT `LoraConfig(r=8, lora_alpha=16)` targeting `q_proj`, `v_proj`, `k_proj`, `o_proj`. Trains for `LORA_EPOCHS` epochs (default 2) on CPU with `learning_rate=2e-4`. |
 | **Merge** | Calls `peft_model.merge_and_unload()` to fold adapter weights into the base model. Saves the merged model to `/app/models/runs/<version>/merged/`. |
@@ -318,6 +324,7 @@ The pipeline only proceeds once the buffer reaches `MIN_RETRAIN_BATCH` items (de
 | **GGUF conversion** | Runs `llama.cpp`'s `convert_hf_to_gguf.py` on the merged model to produce a quantized `model.gguf` (q8_0). Skipped gracefully if `llama.cpp` is not available. |
 | **Ollama registration** | Calls `POST /api/create` on Ollama with a Modelfile pointing to the GGUF. Tags the result as both `medical-risk-ft:<version>` and `medical-risk-ft:latest`. Updates `active_model` in Redis to `medical-risk-ft:latest` so the API can read the current model name without an Ollama tag lookup. |
 | **Model registry** | Appends a run record to `/app/models/registry.json` with version, paths, eval pass rate, action breakdown, override rate, and status (`success` / `eval_failed` / `failed`). |
+| **MLflow logging** | Logs params (`base_model`, `lora_rank`, `lora_alpha`, `epochs`, `lr`, `items_used`, `examples_built`, `override_rate`, `fine_tuned_model_name`) and metrics (`eval_pass_rate`, `override_rate`, `items_used`, `examples_built`). On success: logs the GGUF artifact + LoRA adapter, registers the model in the MLflow model registry as `medical-risk-ft`, and transitions the new version to **Production** (archiving the previous Production version). On eval failure: logs the LoRA adapter artifact and registers with stage **Archived**. Run status is set to FINISHED or FAILED accordingly. |
 | **Buffer clear** | Clears `retrain_buffer.jsonl` only on success. On failure the buffer is preserved for retry and the error is logged. |
 
 #### LoRA configuration
@@ -347,7 +354,18 @@ The fine-tuned model is only used if it is registered in Ollama. If GGUF convers
 
 The `source` field on risk assessment responses reflects which model was used: `"llm:medical-risk-ft"`, `"llm:llama3"`, or `"rule_based"`.
 
-### 5. Monitoring Training Runs
+### 5. MLflow Model Registry
+
+Open **http://localhost:5001** to access the MLflow UI. The `medical-risk-ft` experiment records every training run with:
+
+- **Parameters**: base model, LoRA hyperparameters, dataset size, override rate
+- **Metrics**: eval pass rate, override rate, items used, examples built
+- **Artifacts**: GGUF model file (for successful runs), LoRA adapter weights
+- **Model registry**: the `medical-risk-ft` registered model shows all versions with their lifecycle stage (`Production` for the active model, `Archived` for previous or failed versions)
+
+Stage transitions happen automatically during training. You can also promote, demote, or archive versions manually from the MLflow UI.
+
+### 6. Monitoring Training Runs
 
 ```bash
 # Check buffer depth and recent runs (requires doctor auth)
@@ -423,17 +441,24 @@ Audit log entries are written only at terminal nodes (`retraining_trigger_node` 
 
 #### `triage_node`
 
-Calls Ollama with a structured prompt that defines `routine`, `complex`, and `urgent` in clinical terms. Expects a JSON response `{"classification": "..."}`. Falls back to `"complex"` (the safest default) if Ollama is unreachable or returns an unexpected label. Timeout: 30 s.
+Uses a **two-stage fast path** before calling Ollama:
+
+1. **Rule-based regex match** — two compiled patterns scan the query text instantly:
+   - `_URGENT_PATTERNS`: chest pain, shortness of breath, can't breathe, unconscious, severe pain, stroke, emergency, etc.
+   - `_COMPLEX_PATTERNS`: drug interaction, contraindication, differential diagnosis, polypharmacy, mechanism, etc.
+   If either pattern matches, the node returns immediately (`routine` / `complex` / `urgent`) without any Ollama call — saving ~30 s on common queries.
+
+2. **LLM triage** — only if the regex produces no match, the node calls Ollama with a structured prompt (`num_predict: 20`, `temperature: 0.1`) that defines the three categories in clinical terms. Expects a JSON response `{"classification": "..."}`. Falls back to `"complex"` (the safest default) if Ollama is unreachable or returns an unexpected label. Timeout: 30 s.
 
 #### `rag_node`
 
-Handles **routine** queries. Retrieves the top-3 semantically similar documents from the clinical knowledge base (`agent/knowledge_base.py`) using ChromaDB vector search (cosine similarity over `all-MiniLM-L6-v2` sentence-transformer embeddings), then prompts Ollama to answer grounded in that context. Returns `response` and `confidence`. Timeout: 60 s.
+Handles **routine** queries. Retrieves the top-3 semantically similar documents from the clinical knowledge base (`agent/knowledge_base.py`) using ChromaDB vector search (cosine similarity over `all-MiniLM-L6-v2` sentence-transformer embeddings), then prompts Ollama to answer grounded in that context. Returns `response` and `confidence`. Ollama options: `num_predict: 350`, `temperature: 0.2`. Timeout: 60 s.
 
 The knowledge base contains 12 clinical reference paragraphs (hypertension, T2DM, sepsis, AF, AKI, pneumonia, opioids, etc.) stored in a ChromaDB ephemeral collection initialised at startup. Semantic matching means related concepts match even without exact keyword overlap (e.g., "blood pressure control" matches "hypertension management"). For production, swap `chromadb.EphemeralClient()` for `chromadb.PersistentClient()` (SQLite-backed) or `chromadb.HttpClient()` (separate Chroma server) to persist embeddings across restarts.
 
 #### `reasoning_node`
 
-Handles **complex** queries using chain-of-thought (CoT) prompting. The prompt instructs Ollama to reason step-by-step and produce a JSON object with `chain_of_thought`, `response`, and `confidence`. Timeout: 120 s. If `confidence < 0.5`, the graph routes to `escalation_node`.
+Handles **complex** queries using chain-of-thought (CoT) prompting. The prompt instructs Ollama to reason step-by-step and produce a JSON object with `chain_of_thought`, `response`, and `confidence`. Ollama options: `num_predict: 500`, `temperature: 0.2`. Timeout: 60 s. If `confidence < 0.5`, the graph routes to `escalation_node`.
 
 #### `escalation_node`
 
@@ -514,6 +539,18 @@ def retrieve(query: str, k: int = 3) -> list[str]:
 | Shared across replicas | `chromadb.HttpClient(host="chroma", port=8000)` (requires a Chroma server container) |
 
 To add new clinical documents, append to `_DOCUMENTS` and redeploy — the collection is rebuilt on startup.
+
+---
+
+### Agent Response Cache
+
+`agent/router.py` caches non-escalated agent responses in Redis to avoid redundant LLM calls for identical queries. The cache key is a 16-character SHA-256 prefix of the lowercased query + optional `patient_id`. Cache TTL: 300 s.
+
+```
+cache_key = "agent:" + sha256(f"{query.lower().strip()}|{patient_id or ''}").hexdigest()[:16]
+```
+
+Repeat queries from any doctor hit the cache and return in ~1 ms. Escalated responses are **not** cached — every escalation produces a new `AgentEscalation` DB record. The cache is cluster-shared via Redis, so all doctor-api replicas benefit.
 
 ---
 

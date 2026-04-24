@@ -127,9 +127,45 @@ Displays all patients returned by `GET /v1/doctor/patients`:
 - Last intake timestamp
 - "View" link → `/patients/[id]`
 
-**Escalation alert banner**: At the top of the page, a red banner appears if `GET /v1/escalations/pending` (postcare-api) returns one or more unacknowledged escalations. The banner shows the count and a link to review.
+**Header buttons**:
+- **Escalations** — links to `/escalations`; shows a red count badge when unacknowledged agent escalations are present
+- **Clinical Agent** — links to `/agent`
+- **+ Add Patient** — opens the patient-search modal
 
-Polling: the escalation check runs immediately on mount and repeats every **60 seconds** via `setInterval`.
+**Escalation alert banner**: At the top of the page, a red banner appears if `GET /v1/escalations/pending` (postcare-api) returns one or more unacknowledged check-in escalations. The banner shows the count and affected patient names.
+
+Polling: the check-in escalation poll runs immediately on mount and repeats every **60 seconds** via `setInterval`.
+
+---
+
+#### `/escalations` — Agent Escalation Queue
+
+Lists unacknowledged `AgentEscalation` records for the authenticated doctor's assigned patients, loaded from `GET /v1/agent/escalations`.
+
+Each card shows:
+- **Query type badge**: colour-coded (`urgent` = red, `complex` = amber, `routine` = slate)
+- **Patient name** (if attached to a patient)
+- **Decrypted query text** — the raw clinical question that triggered escalation
+- **Reason for escalation** — explanation from the triage or reasoning node
+- **Timestamp**
+- **Acknowledge & Dismiss** button — calls `POST /v1/agent/escalations/{id}/acknowledge`; removes the card from the list on success
+
+When the queue is empty, a full-page confirmation state is shown. Navigates back to `/patients` via the header breadcrumb.
+
+---
+
+#### `/agent` — Clinical Agent Chat
+
+An interactive chat interface to the LangGraph agent. Submits queries to `POST /v1/agent/query` and displays the structured response.
+
+**Loading state**: while the agent is processing, a cycling loading message is displayed every 2.5 seconds: "Fetching clinical context...", "Analyzing your query...", "Cross-referencing knowledge base...", etc. This replaces a static spinner with informative status feedback during the typical 5–30 s response time.
+
+Response display:
+- **Query type badge** (`routine` / `complex` / `urgent`)
+- **Response text**
+- **Chain-of-thought** (expandable, complex queries only)
+- **Confidence score**
+- **Escalation notice** (if `requires_escalation = true`, with the escalation ID)
 
 ---
 
@@ -154,6 +190,7 @@ Loaded from `GET /v1/doctor/patients/{id}/risk`:
 - **Confidence badge**: colour-coded (`low` = red, `medium` = amber, `high` = green)
 - **Source badge**: `LLM` or `Rule-based`
 - **Summary**: clinical narrative paragraph
+- **Manual Refresh button** — triggers a new `GET /v1/doctor/patients/{id}/risk` call. There is no auto-refresh or polling; the page does not generate new LLM predictions automatically.
 
 **Feedback Form** (below the panel):
 
@@ -174,12 +211,20 @@ On submit: `POST /v1/doctor/patients/{id}/feedback` with `doctor_id` from `local
 
 ```typescript
 loginDoctor(email: string, password: string): Promise<{ doctor_id: string }>
-getPatients(): Promise<Patient[]>
+getPatients(): Promise<PatientListItem[]>
+searchPatient(email: string): Promise<SearchedPatient>
+assignPatient(patientId: string): Promise<void>
 getPatientRisk(patientId: string): Promise<RiskAssessment>
 submitFeedback(patientId: string, data: FeedbackData): Promise<void>
-getPendingEscalations(): Promise<Escalation[]>
+getPendingEscalations(): Promise<Escalation[]>           // postcare-api check-in escalations
 acknowledgeEscalation(escalationId: string): Promise<void>
+getRetrainStatus(): Promise<RetrainStatus>
+agentQuery(body: AgentQueryBody): Promise<AgentQueryResponse>
+getAgentEscalations(): Promise<AgentEscalation[]>        // doctor-api agent escalations
+acknowledgeAgentEscalation(escalationId: string): Promise<void>
 ```
+
+`AgentEscalation` type: `{ id, patient_id, patient_name, query, query_type, reason, created_at }` — query text is decrypted server-side before being returned.
 
 All calls include `credentials: 'include'`. No token parameters.
 
