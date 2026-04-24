@@ -201,6 +201,25 @@ services:
       NEXT_PUBLIC_DOCTOR_API_URL: http://localhost:8002
       NEXT_PUBLIC_POSTCARE_API_URL: http://localhost:8003
 
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.14.1
+    ports:
+      - "5001:5000"
+    command: >
+      mlflow server
+      --host 0.0.0.0
+      --port 5000
+      --backend-store-uri sqlite:////mlflow/mlflow.db
+      --default-artifact-root /mlflow/artifacts
+    volumes:
+      - mlflow_data:/mlflow
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:5000/health')\" 2>/dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
   retrain-worker:
     build: ./services/retrain_worker
     env_file: .env
@@ -217,6 +236,7 @@ services:
       LORA_ALPHA: "16"
       LORA_EPOCHS: "2"
       LORA_LR: "2e-4"
+      MLFLOW_TRACKING_URI: "http://mlflow:5000"
     volumes:
       - ./data:/app/data
       - ./scripts:/app/scripts
@@ -229,6 +249,8 @@ services:
         condition: service_healthy
       ollama:
         condition: service_healthy
+      mlflow:
+        condition: service_healthy
     restart: on-failure
 
 volumes:
@@ -238,3 +260,4 @@ volumes:
   hf_cache:
   prometheus_data:
   grafana_data:
+  mlflow_data:

@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Optional
 
 import httpx
+import mlflow
+import mlflow.tracking
 from sqlalchemy import create_engine, text
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -43,6 +45,9 @@ LORA_RANK = int(os.getenv("LORA_RANK", "8"))
 LORA_ALPHA = int(os.getenv("LORA_ALPHA", "16"))
 LORA_EPOCHS = int(os.getenv("LORA_EPOCHS", "2"))
 LORA_LR = float(os.getenv("LORA_LR", "2e-4"))
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "")
+MLFLOW_EXPERIMENT = "medical-risk-ft"
+MLFLOW_REGISTERED_MODEL = "medical-risk-ft"
 
 _EVAL_SCENARIOS = [
     {
@@ -93,6 +98,25 @@ _EVAL_SCENARIOS = [
 ]
 
 _db_engine = None
+
+
+# ── MLflow helpers ────────────────────────────────────────────────────────────
+
+
+def _mlflow_register_and_transition(run_id: str, stage: str) -> None:
+    """Register the run's model artifact and transition it to the given stage."""
+    try:
+        client = mlflow.tracking.MlflowClient()
+        mv = mlflow.register_model(f"runs:/{run_id}/model", MLFLOW_REGISTERED_MODEL)
+        client.transition_model_version_stage(
+            name=MLFLOW_REGISTERED_MODEL,
+            version=mv.version,
+            stage=stage,
+            archive_existing_versions=(stage == "Production"),
+        )
+        logger.info("MLflow: model v%s → %s", mv.version, stage)
+    except Exception as exc:
+        logger.warning("MLflow registry update failed (non-fatal): %s", exc)
 
 
 def _get_engine():
@@ -559,7 +583,36 @@ def process_buffer() -> int:
         "status": "failed",
     }
 
+    # Set up MLflow (non-fatal if server is unavailable)
+    mlflow_run_id: Optional[str] = None
+    mlflow_active = False
+    if MLFLOW_TRACKING_URI:
+        try:
+            mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+            mlflow.set_experiment(MLFLOW_EXPERIMENT)
+            mlflow_active = True
+        except Exception as exc:
+            logger.warning("MLflow setup failed (non-fatal): %s", exc)
+
+    mlflow_run = mlflow.start_run(run_name=run_timestamp) if mlflow_active else None
+
     try:
+        if mlflow_run:
+            try:
+                mlflow.log_params({
+                    "base_model": BASE_MODEL_NAME,
+                    "lora_rank": LORA_RANK,
+                    "lora_alpha": LORA_ALPHA,
+                    "lora_epochs": LORA_EPOCHS,
+                    "lora_lr": LORA_LR,
+                    "items_used": len(items),
+                    "examples_built": len(examples),
+                    "override_rate": round(override_rate, 4),
+                    "fine_tuned_model_name": FINE_TUNED_MODEL_NAME,
+                })
+            except Exception as exc:
+                logger.warning("MLflow log_params failed (non-fatal): %s", exc)
+
         adapter_dir = train_lora(examples, run_dir)
         metadata["adapter_path"] = str(adapter_dir)
 
@@ -569,18 +622,53 @@ def process_buffer() -> int:
         eval_pass_rate = evaluate_candidate_model(merged_dir)
         metadata["eval_pass_rate"] = round(eval_pass_rate, 4)
 
+        if mlflow_run:
+            try:
+                mlflow.log_metrics({
+                    "eval_pass_rate": eval_pass_rate,
+                    "override_rate": override_rate,
+                    "items_used": len(items),
+                    "examples_built": len(examples),
+                })
+            except Exception as exc:
+                logger.warning("MLflow log_metrics failed (non-fatal): %s", exc)
+
         if eval_pass_rate < 1.0:
             logger.warning(
                 "Eval gate failed (pass_rate=%.0f%%) — aborting promotion. Buffer preserved for retry.",
                 eval_pass_rate * 100,
             )
             metadata["status"] = "eval_failed"
+
+            if mlflow_run:
+                try:
+                    mlflow.set_tag("status", "eval_failed")
+                    mlflow.log_artifact(str(adapter_dir), artifact_path="adapter")
+                    mlflow_run_id = mlflow_run.info.run_id
+                    mlflow.end_run(status="FAILED")
+                    _mlflow_register_and_transition(mlflow_run_id, "Archived")
+                except Exception as exc:
+                    logger.warning("MLflow eval_failed logging error (non-fatal): %s", exc)
+
             append_log(RETRAIN_LOG_PATH, metadata)
             write_model_registry(metadata)
             return -1
 
         gguf_path = convert_to_gguf(merged_dir, run_dir)
         metadata["gguf_path"] = str(gguf_path) if gguf_path else None
+
+        if mlflow_run and gguf_path:
+            try:
+                mlflow.log_artifact(str(gguf_path), artifact_path="model")
+                mlflow.log_artifact(str(adapter_dir), artifact_path="adapter")
+                mlflow.set_tags({
+                    "status": "success",
+                    "gguf_path": str(gguf_path),
+                    "ollama_model": f"{FINE_TUNED_MODEL_NAME}:{run_timestamp}",
+                })
+                mlflow_run_id = mlflow_run.info.run_id
+            except Exception as exc:
+                logger.warning("MLflow artifact logging failed (non-fatal): %s", exc)
 
         ollama_model = None
         if gguf_path:
@@ -594,9 +682,24 @@ def process_buffer() -> int:
         metadata["status"] = "success"
         logger.info("Retraining complete. Version: %s", run_timestamp)
 
+        if mlflow_run:
+            try:
+                mlflow.end_run(status="FINISHED")
+                if mlflow_run_id:
+                    _mlflow_register_and_transition(mlflow_run_id, "Production")
+            except Exception as exc:
+                logger.warning("MLflow end_run/register failed (non-fatal): %s", exc)
+
     except Exception as exc:
         logger.error("Retraining failed: %s", exc, exc_info=True)
         metadata["error"] = str(exc)
+        if mlflow_run:
+            try:
+                mlflow.set_tag("status", "failed")
+                mlflow.set_tag("error", str(exc))
+                mlflow.end_run(status="FAILED")
+            except Exception:
+                pass
 
     append_log(RETRAIN_LOG_PATH, metadata)
     write_model_registry(metadata)
