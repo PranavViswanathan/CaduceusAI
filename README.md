@@ -46,6 +46,15 @@ The stack runs as a Docker Compose application with dependency-ordered startup, 
 ```
 
 ---
+## Screenshots
+<img width="1725" height="942" alt="image" src="https://github.com/user-attachments/assets/986c24d5-1c06-40b2-a9ad-9013302f1db0" />
+
+<img width="1303" height="724" alt="image" src="https://github.com/user-attachments/assets/0c37e2b6-5c95-490b-94af-1494132fb465" />
+
+<img width="980" height="877" alt="image" src="https://github.com/user-attachments/assets/96f124ab-538f-483a-8c71-13ddc1c56567" />
+
+<img width="1501" height="948" alt="image" src="https://github.com/user-attachments/assets/ef72b452-5ec5-485e-9107-2e3e14645a2d" />
+
 
 ## Services
 
