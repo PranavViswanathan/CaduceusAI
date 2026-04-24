@@ -394,4 +394,4 @@ async def retraining_trigger_node(state: AgentState, config: RunnableConfig) -> 
         ip=ip_address,
     )
 
-    return {}
+    return {"response": state["response"]}
