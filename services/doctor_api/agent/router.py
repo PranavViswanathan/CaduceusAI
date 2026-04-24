@@ -14,6 +14,8 @@ Base so that Base.metadata.create_all() in the startup hook creates the
 agent_escalations table automatically.
 """
 
+import hashlib
+import json
 import logging
 from typing import Optional
 
@@ -118,6 +120,19 @@ async def agent_query(
     """
     redis = _get_redis()
 
+    cache_key = "agent:" + hashlib.sha256(
+        f"{body.query.lower().strip()}|{body.patient_id or ''}".encode()
+    ).hexdigest()[:16]
+
+    if redis:
+        try:
+            cached = redis.get(cache_key)
+            if cached:
+                logger.info("agent_query: cache hit for key %s", cache_key)
+                return AgentQueryResponse(**json.loads(cached))
+        except Exception as exc:
+            logger.warning("agent_query: Redis read error: %s", exc)
+
     initial_state = {
         "query": body.query,
         "patient_id": body.patient_id,
@@ -143,7 +158,7 @@ async def agent_query(
         logger.error("agent_query: graph execution failed: %s", exc)
         raise HTTPException(status_code=503, detail="Agent temporarily unavailable") from exc
 
-    return AgentQueryResponse(
+    agent_response = AgentQueryResponse(
         query_type=result["query_type"],
         response=result["response"],
         confidence=result["confidence"],
@@ -151,6 +166,14 @@ async def agent_query(
         escalation_id=result.get("escalation_id"),
         chain_of_thought=result.get("chain_of_thought") or None,
     )
+
+    if redis and not agent_response.requires_escalation:
+        try:
+            redis.setex(cache_key, 300, agent_response.model_dump_json())
+        except Exception as exc:
+            logger.warning("agent_query: Redis write error: %s", exc)
+
+    return agent_response
 
 
 @agent_router.get("/graph")

@@ -68,6 +68,41 @@ def _parse_json_response(raw: str) -> dict:
         return {}
 
 
+# ── Triage keyword rules (avoids an LLM call for obvious cases) ───────────────
+
+_URGENT_PATTERNS = re.compile(
+    r"\b("
+    r"chest pain|chest tightness|can'?t breathe|shortness of breath|difficulty breath"
+    r"|stroke|facial droop|arm weakness|slurred speech"
+    r"|suicid|kill (my|him|her|them)self|overdos"
+    r"|anaphylax|severe allergic|throat closing|throat swelling"
+    r"|unconscious|unresponsive|not breathing|cardiac arrest|heart attack"
+    r"|severe bleed|hemorrhage|code blue|emergency"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_COMPLEX_PATTERNS = re.compile(
+    r"\b("
+    r"interact(ion)?|contraindica|differential|diagnosis|diagnos"
+    r"|treatment plan|interpret|lab result|eGFR|HbA1c|INR|troponin"
+    r"|mechanism|pharmacokinetic|adverse effect|side effect"
+    r"|compare|versus|vs\.?|which is better|risk stratif"
+    r"|polymedication|polypharmacy"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _rule_triage(query: str) -> str | None:
+    """Return triage label if keywords give high confidence, else None."""
+    if _URGENT_PATTERNS.search(query):
+        return "urgent"
+    if _COMPLEX_PATTERNS.search(query):
+        return "complex"
+    return None
+
+
 # ── Node 1: triage_node ───────────────────────────────────────────────────────
 
 
@@ -76,6 +111,12 @@ async def triage_node(state: AgentState, config: RunnableConfig) -> dict:
         return {"query_type": "routine"}
 
     query = state["query"]
+
+    fast_label = _rule_triage(query)
+    if fast_label:
+        logger.info("triage_node: rule-based classification → %s", fast_label)
+        return {"query_type": fast_label}
+
     prompt = (
         "You are a medical query triage system. Classify the query below into exactly one of: "
         "routine, complex, urgent.\n\n"
@@ -101,7 +142,8 @@ async def triage_node(state: AgentState, config: RunnableConfig) -> dict:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 resp = await client.post(
                     f"{settings.OLLAMA_URL}/api/generate",
-                    json={"model": "llama3", "prompt": prompt, "stream": False},
+                    json={"model": "llama3", "prompt": prompt, "stream": False,
+                          "options": {"num_predict": 20, "temperature": 0.1}},
                 )
                 resp.raise_for_status()
                 raw = resp.json().get("response", "")
@@ -172,7 +214,8 @@ async def rag_node(state: AgentState, config: RunnableConfig) -> dict:
             async with httpx.AsyncClient(timeout=60.0) as client:
                 resp = await client.post(
                     f"{settings.OLLAMA_URL}/api/generate",
-                    json={"model": "llama3", "prompt": prompt, "stream": False},
+                    json={"model": "llama3", "prompt": prompt, "stream": False,
+                          "options": {"num_predict": 350, "temperature": 0.2}},
                 )
                 resp.raise_for_status()
                 raw = resp.json().get("response", "")
@@ -240,10 +283,11 @@ async def reasoning_node(state: AgentState, config: RunnableConfig) -> dict:
     with tracer.start_as_current_span("agent.reasoning") as span:
         span.set_attribute("agent.node", "reasoning")
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
+            async with httpx.AsyncClient(timeout=60.0) as client:
                 resp = await client.post(
                     f"{settings.OLLAMA_URL}/api/generate",
-                    json={"model": "llama3", "prompt": prompt, "stream": False},
+                    json={"model": "llama3", "prompt": prompt, "stream": False,
+                          "options": {"num_predict": 500, "temperature": 0.2}},
                 )
                 resp.raise_for_status()
                 raw = resp.json().get("response", "")

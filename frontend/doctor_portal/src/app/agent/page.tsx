@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { agentQuery, getPatients, AgentQueryResponse, PatientListItem } from '@/lib/api'
@@ -12,6 +12,16 @@ type Message = {
   text: string
   response?: AgentQueryResponse
 }
+
+const LOADING_MESSAGES = [
+  'Fetching clinical context...',
+  'Analyzing your query...',
+  'Searching knowledge base...',
+  'Reasoning through the evidence...',
+  'Cross-referencing guidelines...',
+  'Almost there, please hold...',
+  'Compiling the response...',
+]
 
 const QUERY_TYPE_LABEL: Record<string, { label: string; cls: string }> = {
   routine: { label: 'Routine', cls: 'bg-slate-100 text-slate-600' },
@@ -26,10 +36,12 @@ export default function AgentPage() {
   const [messages, setMessages] = useState<Message[]>([])
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
+  const [loadingMsg, setLoadingMsg] = useState(LOADING_MESSAGES[0])
   const [error, setError] = useState('')
   const [showCot, setShowCot] = useState<number | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
   const msgId = useRef(0)
+  const loadingMsgRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   useEffect(() => {
     if (!getDoctorId()) { router.replace('/login'); return }
@@ -39,6 +51,22 @@ export default function AgentPage() {
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
+
+  const startLoadingMessages = useCallback(() => {
+    let idx = 0
+    setLoadingMsg(LOADING_MESSAGES[0])
+    loadingMsgRef.current = setInterval(() => {
+      idx = (idx + 1) % LOADING_MESSAGES.length
+      setLoadingMsg(LOADING_MESSAGES[idx])
+    }, 2500)
+  }, [])
+
+  const stopLoadingMessages = useCallback(() => {
+    if (loadingMsgRef.current) {
+      clearInterval(loadingMsgRef.current)
+      loadingMsgRef.current = null
+    }
+  }, [])
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
@@ -50,6 +78,7 @@ export default function AgentPage() {
     setInput('')
     setLoading(true)
     setError('')
+    startLoadingMessages()
 
     try {
       const response = await agentQuery(query, selectedPatientId || undefined)
@@ -63,6 +92,7 @@ export default function AgentPage() {
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Agent query failed')
     } finally {
+      stopLoadingMessages()
       setLoading(false)
     }
   }
@@ -168,9 +198,9 @@ export default function AgentPage() {
 
           {loading && (
             <div className="flex justify-start">
-              <div className="bg-slate-50 border border-slate-200 rounded-2xl rounded-bl-sm px-4 py-3 flex items-center gap-2">
-                <div className="w-4 h-4 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
-                <span className="text-sm text-slate-500">Thinking...</span>
+              <div className="bg-slate-50 border border-slate-200 rounded-2xl rounded-bl-sm px-4 py-3 flex items-center gap-2 min-w-[220px]">
+                <div className="w-4 h-4 border-2 border-blue-600 border-t-transparent rounded-full animate-spin flex-shrink-0" />
+                <span key={loadingMsg} className="text-sm text-slate-500 animate-pulse">{loadingMsg}</span>
               </div>
             </div>
           )}
