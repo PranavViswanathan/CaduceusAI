@@ -3,7 +3,11 @@
 import { useState, useEffect, useRef } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
-import { getPatients, getPendingEscalations, getRetrainStatus, PatientListItem, Escalation, RetrainStatus } from '@/lib/api'
+import {
+  getPatients, getPendingEscalations, getRetrainStatus,
+  searchPatient, assignPatient,
+  PatientListItem, Escalation, RetrainStatus, SearchedPatient,
+} from '@/lib/api'
 import { getDoctorId, logout } from '@/lib/auth'
 
 export default function PatientsPage() {
@@ -14,6 +18,15 @@ export default function PatientsPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  // Add patient modal state
+  const [modalOpen, setModalOpen] = useState(false)
+  const [searchEmail, setSearchEmail] = useState('')
+  const [searchResult, setSearchResult] = useState<SearchedPatient | null>(null)
+  const [searching, setSearching] = useState(false)
+  const [searchError, setSearchError] = useState('')
+  const [assigning, setAssigning] = useState(false)
+  const [assignSuccess, setAssignSuccess] = useState(false)
 
   async function loadEscalations() {
     try {
@@ -32,7 +45,6 @@ export default function PatientsPage() {
       .catch(err => setError(err instanceof Error ? err.message : 'Failed to load'))
       .finally(() => setLoading(false))
 
-    // Poll escalations every 60 seconds
     intervalRef.current = setInterval(loadEscalations, 60_000)
     return () => { if (intervalRef.current) clearInterval(intervalRef.current) }
   }, [router])
@@ -40,6 +52,52 @@ export default function PatientsPage() {
   async function handleLogout() {
     await logout()
     router.push('/login')
+  }
+
+  function openModal() {
+    setModalOpen(true)
+    setSearchEmail('')
+    setSearchResult(null)
+    setSearchError('')
+    setAssignSuccess(false)
+  }
+
+  function closeModal() {
+    setModalOpen(false)
+  }
+
+  async function handleSearch(e: React.FormEvent) {
+    e.preventDefault()
+    if (!searchEmail.trim()) return
+    setSearching(true)
+    setSearchError('')
+    setSearchResult(null)
+    setAssignSuccess(false)
+    try {
+      const result = await searchPatient(searchEmail.trim())
+      setSearchResult(result)
+    } catch (err) {
+      setSearchError(err instanceof Error ? err.message : 'Patient not found')
+    } finally {
+      setSearching(false)
+    }
+  }
+
+  async function handleAssign() {
+    if (!searchResult) return
+    setAssigning(true)
+    setSearchError('')
+    try {
+      await assignPatient(searchResult.id)
+      setAssignSuccess(true)
+      // Refresh patient list
+      const updated = await getPatients()
+      setPatients(updated)
+    } catch (err) {
+      setSearchError(err instanceof Error ? err.message : 'Failed to assign patient')
+    } finally {
+      setAssigning(false)
+    }
   }
 
   if (loading) {
@@ -60,11 +118,25 @@ export default function PatientsPage() {
         <div className="flex items-center justify-between mb-6">
           <div>
             <h1 className="text-2xl font-bold text-slate-900">Patient Overview</h1>
-            <p className="text-slate-500 text-sm mt-0.5">{patients.length} patient{patients.length !== 1 ? 's' : ''} registered</p>
+            <p className="text-slate-500 text-sm mt-0.5">{patients.length} patient{patients.length !== 1 ? 's' : ''} assigned</p>
           </div>
-          <button onClick={handleLogout} className="px-4 py-2 text-slate-600 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg text-sm font-medium transition-colors">
-            Sign Out
-          </button>
+          <div className="flex items-center gap-3">
+            <Link
+              href="/agent"
+              className="px-4 py-2 text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-lg text-sm font-medium transition-colors"
+            >
+              Clinical Agent
+            </Link>
+            <button
+              onClick={openModal}
+              className="px-4 py-2 text-white bg-blue-900 hover:bg-blue-800 rounded-lg text-sm font-medium transition-colors"
+            >
+              + Add Patient
+            </button>
+            <button onClick={handleLogout} className="px-4 py-2 text-slate-600 bg-white hover:bg-slate-50 border border-slate-200 rounded-lg text-sm font-medium transition-colors">
+              Sign Out
+            </button>
+          </div>
         </div>
 
         {/* Escalation banner */}
@@ -135,7 +207,9 @@ export default function PatientsPage() {
             <tbody>
               {patients.length === 0 ? (
                 <tr>
-                  <td colSpan={4} className="text-center py-12 text-slate-400 text-sm">No patients registered yet</td>
+                  <td colSpan={4} className="text-center py-12 text-slate-400 text-sm">
+                    No patients assigned yet — use &quot;+ Add Patient&quot; to assign one
+                  </td>
                 </tr>
               ) : (
                 patients.map((p, i) => (
@@ -169,6 +243,65 @@ export default function PatientsPage() {
           </table>
         </div>
       </div>
+
+      {/* Add Patient Modal */}
+      {modalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 px-4">
+          <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-6">
+            <div className="flex items-center justify-between mb-5">
+              <h2 className="text-lg font-bold text-slate-900">Add Patient</h2>
+              <button onClick={closeModal} className="text-slate-400 hover:text-slate-600 text-xl leading-none">&times;</button>
+            </div>
+
+            <form onSubmit={handleSearch} className="flex gap-2 mb-4">
+              <input
+                type="email"
+                value={searchEmail}
+                onChange={e => setSearchEmail(e.target.value)}
+                placeholder="Patient email address"
+                className="flex-1 px-3 py-2 border border-slate-300 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+                autoFocus
+              />
+              <button
+                type="submit"
+                disabled={searching || !searchEmail.trim()}
+                className="px-4 py-2 bg-blue-900 hover:bg-blue-800 disabled:opacity-40 text-white text-sm font-medium rounded-lg transition-colors"
+              >
+                {searching ? '...' : 'Search'}
+              </button>
+            </form>
+
+            {searchError && (
+              <p className="mb-3 text-sm text-red-600">{searchError}</p>
+            )}
+
+            {searchResult && !assignSuccess && (
+              <div className="border border-slate-200 rounded-xl p-4 mb-4">
+                <p className="text-sm font-semibold text-slate-900">{searchResult.name}</p>
+                <p className="text-xs text-slate-500 mt-0.5">{searchResult.email}</p>
+                <button
+                  onClick={handleAssign}
+                  disabled={assigning}
+                  className="mt-3 w-full bg-blue-900 hover:bg-blue-800 disabled:opacity-40 text-white text-sm font-semibold py-2 rounded-lg transition-colors"
+                >
+                  {assigning ? 'Assigning...' : 'Assign to my patients'}
+                </button>
+              </div>
+            )}
+
+            {assignSuccess && (
+              <div className="p-3 bg-green-50 border border-green-200 rounded-lg text-green-700 text-sm flex items-center gap-2 mb-4">
+                <span>✓</span>
+                <span><span className="font-semibold">{searchResult?.name}</span> has been added to your patient list.</span>
+              </div>
+            )}
+
+            <button onClick={closeModal} className="w-full text-slate-500 hover:text-slate-700 text-sm py-2 text-center">
+              {assignSuccess ? 'Close' : 'Cancel'}
+            </button>
+          </div>
+        </div>
+      )}
     </main>
   )
 }

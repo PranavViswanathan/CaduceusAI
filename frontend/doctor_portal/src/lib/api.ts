@@ -13,7 +13,7 @@ export type RiskAssessment = {
   risks: string[]
   confidence: 'low' | 'medium' | 'high'
   summary: string
-  source: 'llm' | 'rule_based'
+  source: 'llm' | 'rule_based' | 'demo'
   version: number
   created_at: string
 }
@@ -21,7 +21,6 @@ export type RiskAssessment = {
 export type FeedbackPayload = {
   action: 'agree' | 'override' | 'flag'
   reason?: string
-  doctor_id: string
   assessment_id?: string
 }
 
@@ -64,6 +63,21 @@ export type PatientDetail = {
   intake_submitted_at: string | null
 }
 
+export type SearchedPatient = {
+  id: string
+  name: string
+  email: string
+}
+
+export type AgentQueryResponse = {
+  query_type: 'routine' | 'complex' | 'urgent'
+  response: string
+  confidence: number
+  requires_escalation: boolean
+  escalation_id: string | null
+  chain_of_thought: string | null
+}
+
 async function handleResponse<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let message = `Request failed: ${res.status}`
@@ -89,6 +103,21 @@ export async function loginDoctor(email: string, password: string): Promise<{ do
 
 export async function getPatients(): Promise<PatientListItem[]> {
   const res = await fetch(`${DOCTOR_API}/v1/doctor/patients`, {
+    credentials: 'include',
+  })
+  return handleResponse(res)
+}
+
+export async function searchPatient(email: string): Promise<SearchedPatient> {
+  const res = await fetch(`${DOCTOR_API}/v1/doctor/patients/search?email=${encodeURIComponent(email)}`, {
+    credentials: 'include',
+  })
+  return handleResponse(res)
+}
+
+export async function assignPatient(patientId: string): Promise<void> {
+  const res = await fetch(`${DOCTOR_API}/v1/doctor/patients/${patientId}/assign`, {
+    method: 'POST',
     credentials: 'include',
   })
   return handleResponse(res)
@@ -129,6 +158,19 @@ export async function acknowledgeEscalation(escalationId: string): Promise<void>
   const res = await fetch(`${POSTCARE_API}/v1/escalations/${escalationId}/acknowledge`, {
     method: 'POST',
     credentials: 'include',
+  })
+  return handleResponse(res)
+}
+
+export async function agentQuery(
+  query: string,
+  patientId?: string,
+): Promise<AgentQueryResponse> {
+  const res = await fetch(`${DOCTOR_API}/v1/agent/query`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ query, patient_id: patientId || null }),
   })
   return handleResponse(res)
 }

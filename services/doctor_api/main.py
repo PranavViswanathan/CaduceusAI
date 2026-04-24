@@ -167,6 +167,18 @@ def logout(response: Response):
     return {"status": "logged out"}
 
 
+@router.get("/doctor/patients/search")
+def search_patient_by_email(
+    email: str,
+    current_doctor: Doctor = Depends(get_current_doctor),
+    db: Session = Depends(get_db),
+):
+    patient = db.query(Patient).filter(Patient.email == email).first()
+    if not patient:
+        raise HTTPException(status_code=404, detail="No patient found with that email")
+    return {"id": str(patient.id), "name": patient.name, "email": patient.email}
+
+
 @router.get("/doctor/patients")
 def list_patients(
     request: Request,
@@ -289,6 +301,32 @@ async def get_patient_risk(
         except Exception as exc:
             logger.warning("Redis read error: %s", exc)
 
+    # Return existing assessment from DB without calling LLM again
+    try:
+        existing = db.query(RiskAssessment).filter(
+            RiskAssessment.patient_id == patient_id
+        ).order_by(RiskAssessment.version.desc()).first()
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=503, detail="Database unavailable") from exc
+
+    if existing:
+        response = RiskAssessmentResponse(
+            id=existing.id,
+            risks=existing.risks,
+            confidence=existing.confidence,
+            summary=existing.summary,
+            source=existing.source,
+            version=existing.version,
+            created_at=existing.created_at,
+        )
+        if redis:
+            try:
+                redis.setex(cache_key, 300, response.model_dump_json())
+            except Exception as exc:
+                logger.warning("Redis write error: %s", exc)
+        write_structured_log(f"/v1/doctor/patients/{patient_id}/risk", "risk_db_hit", "success", request, str(current_doctor.id), patient_id)
+        return response
+
     try:
         patient = db.query(Patient).filter(Patient.id == patient_id).first()
         if not patient:
@@ -315,8 +353,8 @@ async def get_patient_risk(
 
     assessment_dict = await get_risk_assessment(patient_data)
 
-    prev = db.query(RiskAssessment).filter(RiskAssessment.patient_id == patient_id).order_by(RiskAssessment.version.desc()).first()
-    version = (prev.version + 1) if prev else 1
+    prev = None
+    version = 1
 
     try:
         assessment = RiskAssessment(

@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { useRouter, useParams } from 'next/navigation'
 import Link from 'next/link'
 import {
@@ -8,8 +8,6 @@ import {
   PatientListItem, RiskAssessment, FeedbackPayload
 } from '@/lib/api'
 import { getDoctorId } from '@/lib/auth'
-
-const POLL_INTERVAL = 60
 
 type FeedbackAction = 'agree' | 'override' | 'flag'
 
@@ -23,7 +21,6 @@ export default function PatientDetailPage() {
   const [loadingPatient, setLoadingPatient] = useState(true)
   const [loadingRisk, setLoadingRisk] = useState(true)
   const [riskError, setRiskError] = useState(false)
-  const [countdown, setCountdown] = useState(POLL_INTERVAL)
 
   // Feedback state
   const [feedbackAction, setFeedbackAction] = useState<FeedbackAction | null>(null)
@@ -31,9 +28,6 @@ export default function PatientDetailPage() {
   const [feedbackSubmitting, setFeedbackSubmitting] = useState(false)
   const [feedbackSuccess, setFeedbackSuccess] = useState(false)
   const [feedbackError, setFeedbackError] = useState('')
-
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
-  const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   const fetchRisk = useCallback(async () => {
     setLoadingRisk(true)
@@ -59,22 +53,6 @@ export default function PatientDetailPage() {
 
     // Load risk assessment
     fetchRisk()
-
-    // Poll every 60 seconds
-    pollRef.current = setInterval(() => {
-      fetchRisk()
-      setCountdown(POLL_INTERVAL)
-    }, POLL_INTERVAL * 1000)
-
-    // Countdown timer
-    countdownRef.current = setInterval(() => {
-      setCountdown(c => Math.max(c - 1, 0))
-    }, 1000)
-
-    return () => {
-      if (pollRef.current) clearInterval(pollRef.current)
-      if (countdownRef.current) clearInterval(countdownRef.current)
-    }
   }, [patientId, router, fetchRisk])
 
   async function handleFeedbackSubmit(e: React.FormEvent) {
@@ -84,8 +62,7 @@ export default function PatientDetailPage() {
       setFeedbackError('Please provide your clinical reasoning')
       return
     }
-    const doctorId = getDoctorId()
-    if (!doctorId) { router.replace('/login'); return }
+    if (!getDoctorId()) { router.replace('/login'); return }
 
     setFeedbackSubmitting(true)
     setFeedbackError('')
@@ -93,7 +70,6 @@ export default function PatientDetailPage() {
       const payload: FeedbackPayload = {
         action: feedbackAction,
         reason: overrideReason || undefined,
-        doctor_id: doctorId,
         assessment_id: risk?.id,
       }
       await submitFeedback(patientId, payload)
@@ -157,15 +133,12 @@ export default function PatientDetailPage() {
             <div className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6">
               <div className="flex items-center justify-between mb-4">
                 <h2 className="text-lg font-bold text-slate-900">AI Risk Assessment</h2>
-                <div className="flex items-center gap-3">
-                  <span className="text-xs text-slate-400">Auto-refresh in {countdown}s</span>
-                  <button
-                    onClick={() => { fetchRisk(); setCountdown(POLL_INTERVAL) }}
-                    className="text-xs text-blue-600 hover:text-blue-800 font-medium"
-                  >
-                    Refresh ↺
-                  </button>
-                </div>
+                <button
+                  onClick={() => fetchRisk()}
+                  className="text-xs text-blue-600 hover:text-blue-800 font-medium"
+                >
+                  Refresh ↺
+                </button>
               </div>
 
               {loadingRisk ? (
