@@ -122,6 +122,12 @@ export default function PatientsPage() {
           </div>
           <div className="flex items-center gap-3">
             <Link
+              href="/escalations"
+              className="px-4 py-2 text-red-700 bg-red-50 hover:bg-red-100 border border-red-200 rounded-lg text-sm font-medium transition-colors"
+            >
+              Escalations {escalations.length > 0 && <span className="ml-1 px-1.5 py-0.5 bg-red-600 text-white text-xs rounded-full">{escalations.length}</span>}
+            </Link>
+            <Link
               href="/agent"
               className="px-4 py-2 text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-lg text-sm font-medium transition-colors"
             >

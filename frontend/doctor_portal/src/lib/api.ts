@@ -78,6 +78,16 @@ export type AgentQueryResponse = {
   chain_of_thought: string | null
 }
 
+export type AgentEscalation = {
+  id: string
+  patient_id: string | null
+  patient_name: string | null
+  query: string
+  query_type: string
+  reason: string | null
+  created_at: string
+}
+
 async function handleResponse<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let message = `Request failed: ${res.status}`
@@ -156,6 +166,21 @@ export async function getRetrainStatus(): Promise<RetrainStatus> {
 
 export async function acknowledgeEscalation(escalationId: string): Promise<void> {
   const res = await fetch(`${POSTCARE_API}/v1/escalations/${escalationId}/acknowledge`, {
+    method: 'POST',
+    credentials: 'include',
+  })
+  return handleResponse(res)
+}
+
+export async function getAgentEscalations(): Promise<AgentEscalation[]> {
+  const res = await fetch(`${DOCTOR_API}/v1/agent/escalations`, {
+    credentials: 'include',
+  })
+  return handleResponse(res)
+}
+
+export async function acknowledgeAgentEscalation(escalationId: string): Promise<void> {
+  const res = await fetch(`${DOCTOR_API}/v1/agent/escalations/${escalationId}/acknowledge`, {
     method: 'POST',
     credentials: 'include',
   })

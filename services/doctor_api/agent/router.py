@@ -26,7 +26,8 @@ from sqlalchemy.orm import Session
 
 from auth import get_current_doctor
 from database import get_db
-from models import Doctor
+from encryption import decrypt
+from models import Doctor, DoctorPatientAssignment, Patient
 from settings import settings
 
 from .graph import get_graph_definition, graph
@@ -174,6 +175,61 @@ async def agent_query(
             logger.warning("agent_query: Redis write error: %s", exc)
 
     return agent_response
+
+
+@agent_router.get("/escalations")
+def list_agent_escalations(
+    current_doctor: Doctor = Depends(get_current_doctor),
+    db: Session = Depends(get_db),
+):
+    assigned_ids = (
+        db.query(DoctorPatientAssignment.patient_id)
+        .filter(DoctorPatientAssignment.doctor_id == current_doctor.id)
+        .subquery()
+    )
+    escalations = (
+        db.query(AgentEscalation)
+        .filter(
+            AgentEscalation.acknowledged.is_(False),
+            (AgentEscalation.patient_id.is_(None) | AgentEscalation.patient_id.in_(assigned_ids)),
+        )
+        .order_by(AgentEscalation.created_at.desc())
+        .all()
+    )
+    result = []
+    for esc in escalations:
+        patient = (
+            db.query(Patient).filter(Patient.id == esc.patient_id).first()
+            if esc.patient_id else None
+        )
+        try:
+            query_text = decrypt(esc.query_encrypted)
+        except Exception:
+            query_text = "[encrypted]"
+        result.append({
+            "id": str(esc.id),
+            "patient_id": str(esc.patient_id) if esc.patient_id else None,
+            "patient_name": patient.name if patient else None,
+            "query": query_text,
+            "query_type": esc.query_type,
+            "reason": esc.reason,
+            "created_at": esc.created_at.isoformat(),
+        })
+    return result
+
+
+@agent_router.post("/escalations/{escalation_id}/acknowledge")
+def acknowledge_agent_escalation(
+    escalation_id: str,
+    current_doctor: Doctor = Depends(get_current_doctor),
+    db: Session = Depends(get_db),
+):
+    esc = db.query(AgentEscalation).filter(AgentEscalation.id == escalation_id).first()
+    if not esc:
+        raise HTTPException(status_code=404, detail="Escalation not found")
+    esc.acknowledged = True
+    db.commit()
+    return {"acknowledged": True}
 
 
 @agent_router.get("/graph")
