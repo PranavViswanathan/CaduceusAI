@@ -74,10 +74,10 @@ graph TD
     DPA -->|assert assigned before risk/feedback| DA
     PCA -->|write care plans + checkins| PG
 
-    DA -->|1 Redis cache check\nrisk TTL 5m| RD
+    DA -->|1 risk cache check TTL 5m| RD
     RD -->|cache miss| DA
-    DA -->|2 DB fallback on miss\nreturn existing row| PG
-    PG -->|DB hit → re-cache| RD
+    DA -->|2 DB fallback on cache miss| PG
+    PG -->|DB hit re-cache| RD
     PCA <-->|escalation_queue| RD
     DA -->|RPUSH on override/flag| RQ
     RQ -->|LPOP drain| RB2
@@ -85,26 +85,26 @@ graph TD
     RS -->|PEFT LoRA train + GGUF| OLF
     RS --> RL
     RS --> MR
-    RS -->|log params + metrics\n+ artifacts| MLF
+    RS -->|log params + metrics + artifacts| MLF
     MLF -->|transition to Production| OLF
     OLF -->|medical-risk-ft preferred| DA
 
     subgraph AGENT["LangGraph Agent (doctor-api)"]
-        TN["triage_node\n① rule regex\n② Ollama LLM"]
+        TN["triage_node\n1 rule regex fast path\n2 Ollama LLM fallback"]
         RAN["rag_node\nChromaDB + Ollama\nnum_predict 350"]
         REN["reasoning_node\nCoT + Ollama\nnum_predict 500"]
-        EN["escalation_node\nPHI-encrypt → DB"]
+        EN["escalation_node\nPHI-encrypt to DB"]
         RT["retraining_trigger_node\nfeedback_score check"]
         AE[("agent_escalations\nPHI-encrypted")]
-        AC[("agent response\ncache Redis 5m")]
+        AC[("agent response cache\nRedis TTL 5m")]
         TN -->|routine| RAN
         TN -->|complex| REN
         TN -->|urgent| EN
-        REN -->|conf≥0.5| RT
-        REN -->|conf<0.5| EN
+        REN -->|conf ge 0.5| RT
+        REN -->|conf lt 0.5| EN
         RAN --> RT
         EN --> AE
-        RT -->|non-escalation hit| AC
+        RT -->|cache non-escalation| AC
     end
 
     DA <-->|/v1/agent/query| AGENT
@@ -112,16 +112,16 @@ graph TD
     AGENT -->|retrain_queue lpush| RD
     AGENT -->|triage + RAG + CoT prompts| OL
 
-    DP -->|GET /v1/agent/escalations\n/escalations page| DA
-    DA -->|decrypt + list| AE
+    DP -->|GET /v1/agent/escalations| DA
+    DA -->|decrypt + list agent escalations| AE
 
-    DA -->|risk prompt\n(only on first req\nor after feedback)| OL
+    DA -->|risk prompt on first req or after feedback| OL
     PCA -->|care plan + urgency prompt| OL
     OL -->|unavailable| RB
     OL -->|unavailable| KW
     OL -->|unavailable| ST
 
-    DP -->|poll check-in escalations\nevery 60s| PCA
+    DP -->|poll check-in escalations every 60s| PCA
     PP -->|read care plan| PCA
 
     DA <-->|X-Internal-Key| PCA
